@@ -7,6 +7,7 @@
     marshmallow.schema
     marshmallow.fields
     marshmallow.decorators
+    marshmallow.provenance
     marshmallow.validate
     marshmallow.utils
     marshmallow.experimental.context

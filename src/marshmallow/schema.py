@@ -32,6 +32,7 @@ from marshmallow.decorators import (
 from marshmallow.error_store import ErrorStore
 from marshmallow.exceptions import SCHEMA, StringNotCollectionError, ValidationError
 from marshmallow.orderedset import OrderedSet
+from marshmallow.provenance import FieldSource, LoadResult, SourceNode, _source_sink
 from marshmallow.utils import (
     get_value,
     is_collection,
@@ -603,6 +604,7 @@ class Schema(metaclass=SchemaMeta):
         partial=None,
         unknown: types.UnknownOption = RAISE,
         index=None,
+        source_node: SourceNode | None = None,
     ) -> typing.Any | list[typing.Any]:
         """Deserialize ``data``.
 
@@ -617,6 +619,8 @@ class Schema(metaclass=SchemaMeta):
             fields in the data. Use `EXCLUDE`, `INCLUDE` or `RAISE`.
         :param index: Index of the item being deserialized (for storing errors) if
             deserializing a collection, otherwise `None`.
+        :param source_node: If not `None`, record the source (supplied, defaulted,
+            or omitted) of each field into this node. Private API.
         :return: The deserialized data as `dict_class` instance or list of `dict_class`
         instances if `many` is `True`.
         """
@@ -626,23 +630,36 @@ class Schema(metaclass=SchemaMeta):
                 error_store.store_error([self.error_messages["type"]], index=index)
                 ret_l = []
             else:
-                ret_l = [
-                    self._deserialize(
-                        d,
-                        error_store=error_store,
-                        many=False,
-                        partial=partial,
-                        unknown=unknown,
-                        index=idx,
+                if source_node is not None:
+                    source_node.children = []
+                ret_l = []
+                for idx, d in enumerate(data):
+                    if source_node is not None:
+                        child_node = SourceNode()
+                        typing.cast("list[SourceNode]", source_node.children).append(
+                            child_node
+                        )
+                    else:
+                        child_node = None  # type: ignore[assignment]
+                    ret_l.append(
+                        self._deserialize(
+                            d,
+                            error_store=error_store,
+                            many=False,
+                            partial=partial,
+                            unknown=unknown,
+                            index=idx,
+                            source_node=child_node,
+                        )
                     )
-                    for idx, d in enumerate(data)
-                ]
             return ret_l
         ret_d = self.dict_class()
         # Check data is a dict
         if not isinstance(data, Mapping):
             error_store.store_error([self.error_messages["type"]], index=index)
         else:
+            if source_node is not None:
+                source_node.children = {}
             partial_is_collection = is_collection(partial)
             for attr_name, field_obj in self.load_fields.items():
                 field_name = (
@@ -654,6 +671,14 @@ class Schema(metaclass=SchemaMeta):
                     if partial is True or (
                         partial_is_collection and attr_name in partial
                     ):
+                        if source_node is not None:
+                            self._record_field_source(
+                                source_node,
+                                attr_name=attr_name,
+                                field_obj=field_obj,
+                                status=FieldSource.OMITTED,
+                                sink=None,
+                            )
                         continue
                 d_kwargs = {}
                 # Allow partial loading of nested schemas.
@@ -677,13 +702,44 @@ class Schema(metaclass=SchemaMeta):
                         **d_kwargs,
                     )
 
-                value = self._call_and_store(
-                    getter_func=getter,
-                    data=raw_value,
-                    field_name=field_name,
-                    error_store=error_store,
-                    index=index,
-                )
+                if source_node is not None:
+                    # Collect source nodes from any nested schema loads that
+                    # happen while deserializing this field.
+                    sink: list[SourceNode] = []
+                    token = _source_sink.set(sink)
+                    try:
+                        value = self._call_and_store(
+                            getter_func=getter,
+                            data=raw_value,
+                            field_name=field_name,
+                            error_store=error_store,
+                            index=index,
+                        )
+                    finally:
+                        _source_sink.reset(token)
+                    if raw_value is missing:
+                        status = (
+                            FieldSource.DEFAULTED
+                            if field_obj.load_default is not missing
+                            else FieldSource.OMITTED
+                        )
+                    else:
+                        status = FieldSource.SUPPLIED
+                    self._record_field_source(
+                        source_node,
+                        attr_name=attr_name,
+                        field_obj=field_obj,
+                        status=status,
+                        sink=sink,
+                    )
+                else:
+                    value = self._call_and_store(
+                        getter_func=getter,
+                        data=raw_value,
+                        field_name=field_name,
+                        error_store=error_store,
+                        index=index,
+                    )
                 if value is not missing:
                     key = field_obj.attribute or attr_name
                     set_value(ret_d, key, value)
@@ -696,6 +752,10 @@ class Schema(metaclass=SchemaMeta):
                     value = data[key]
                     if unknown == INCLUDE:
                         ret_d[key] = value
+                        if source_node is not None:
+                            typing.cast("dict[str, SourceNode]", source_node.children)[
+                                key
+                            ] = SourceNode(status=FieldSource.SUPPLIED)
                     elif unknown == RAISE:
                         error_store.store_error(
                             [self.error_messages["unknown"]],
@@ -703,6 +763,31 @@ class Schema(metaclass=SchemaMeta):
                             index,
                         )
         return ret_d
+
+    @staticmethod
+    def _record_field_source(
+        source_node: SourceNode,
+        *,
+        attr_name: str,
+        field_obj: Field,
+        status: FieldSource,
+        sink: list[SourceNode] | None,
+    ) -> None:
+        """Record the source of a single field on ``source_node``.
+        This method is private API.
+        """
+        key = field_obj.attribute or attr_name
+        child = SourceNode(status=status)
+        if isinstance(field_obj, ma_fields.List):
+            # One node per item of the collection.
+            child.children = list(sink) if sink else []
+        elif sink:
+            child.children = sink[0].children if len(sink) == 1 else list(sink)
+            if len(sink) == 1:
+                child.key_map = sink[0].key_map
+        typing.cast("dict[str, SourceNode]", source_node.children)[key] = child
+        field_name = field_obj.data_key if field_obj.data_key is not None else attr_name
+        source_node.key_map[field_name] = key
 
     def load(
         self,
@@ -733,6 +818,57 @@ class Schema(metaclass=SchemaMeta):
         """
         return self._do_load(
             data, many=many, partial=partial, unknown=unknown, postprocess=True
+        )
+
+    def load_with_sources(
+        self,
+        data: Mapping[str, typing.Any] | Sequence[Mapping[str, typing.Any]],
+        *,
+        many: bool | None = None,
+        partial: bool | types.StrSequenceOrSet | None = None,
+        unknown: types.UnknownOption | None = None,
+    ) -> LoadResult:
+        """Deserialize `data` like `load <marshmallow.Schema.load>`, but return a
+        `LoadResult <marshmallow.provenance.LoadResult>` that also records where
+        each field's value came from.
+
+        Field sources are determined from the input data *after* ``pre_load``
+        processors have run, and are one of `FieldSource.SUPPLIED
+        <marshmallow.provenance.FieldSource>`,
+        ``FieldSource.DEFAULTED``, or ``FieldSource.OMITTED``. Sources are
+        tracked through `Nested <marshmallow.fields.Nested>` fields,
+        `List <marshmallow.fields.List>` fields, ``many=True``, and ``partial``
+        loads, and remain available after ``post_load`` processors transform
+        the data into custom objects.
+
+        If validation fails, a `ValidationError <marshmallow.exceptions.ValidationError>`
+        is raised as usual; its ``valid_data`` attribute holds the valid portion
+        of the data and its ``sources`` attribute holds a `LoadResult
+        <marshmallow.provenance.LoadResult>` with the sources of that portion.
+
+        :param data: The data to deserialize.
+        :param many: Whether to deserialize `data` as a collection. If `None`, the
+            value for `self.many` is used.
+        :param partial: Whether to ignore missing fields and not require
+            any fields declared. Propagates down to ``Nested`` fields as well. If
+            its value is an iterable, only missing fields listed in that iterable
+            will be ignored. Use dot delimiters to specify nested fields.
+        :param unknown: Whether to exclude, include, or raise an error for unknown
+            fields in the data. Use `EXCLUDE`, `INCLUDE` or `RAISE`.
+            If `None`, the value for `self.unknown` is used.
+        :return: A `LoadResult <marshmallow.provenance.LoadResult>` pairing the
+            deserialized data with the field sources.
+        """
+        return typing.cast(
+            "LoadResult",
+            self._do_load(
+                data,
+                many=many,
+                partial=partial,
+                unknown=unknown,
+                postprocess=True,
+                track_sources=True,
+            ),
         )
 
     def loads(
@@ -847,6 +983,7 @@ class Schema(metaclass=SchemaMeta):
         partial: bool | types.StrSequenceOrSet | None = None,
         unknown: types.UnknownOption | None = None,
         postprocess: bool = True,
+        track_sources: bool = False,
     ):
         """Deserialize `data`, returning the deserialized result.
         This method is private API.
@@ -862,7 +999,11 @@ class Schema(metaclass=SchemaMeta):
             fields in the data. Use `EXCLUDE`, `INCLUDE` or `RAISE`.
             If `None`, the value for `self.unknown` is used.
         :param postprocess: Whether to run post_load methods.
-        :return: Deserialized data
+        :param track_sources: Whether to track the source (supplied, defaulted,
+            or omitted) of each field and return a
+            `LoadResult <marshmallow.provenance.LoadResult>`.
+        :return: Deserialized data, or a `LoadResult
+            <marshmallow.provenance.LoadResult>` if ``track_sources`` is `True`.
         """
         error_store = ErrorStore()
         errors: dict[str, list[str]] = {}
@@ -870,6 +1011,11 @@ class Schema(metaclass=SchemaMeta):
         unknown = self.unknown if unknown is None else unknown
         if partial is None:
             partial = self.partial
+        # If set, this load is nested within a tracked load and must report
+        # its source node to the parent schema through the sink.
+        parent_sink = _source_sink.get()
+        tracking = track_sources or parent_sink is not None
+        root_node = SourceNode() if tracking else None
         # Run preprocessors
         if self._hooks[PRE_LOAD]:
             try:
@@ -894,6 +1040,7 @@ class Schema(metaclass=SchemaMeta):
                 many=many,
                 partial=partial,
                 unknown=unknown,
+                source_node=root_node,
             )
             # Run field-level validation
             self._invoke_field_validators(
@@ -938,9 +1085,19 @@ class Schema(metaclass=SchemaMeta):
                     errors = err.normalized_messages()
         if errors:
             exc = ValidationError(errors, data=data, valid_data=result)
+            if track_sources:
+                # Preserve the sources of the valid portion on the error so a
+                # failed load does not look like a (partial) success.
+                exc.sources = LoadResult(result, typing.cast("SourceNode", root_node))
             self.handle_error(exc, data, many=many, partial=partial)
+            if parent_sink is not None:
+                parent_sink.append(typing.cast("SourceNode", root_node))
             raise exc
 
+        if parent_sink is not None:
+            parent_sink.append(typing.cast("SourceNode", root_node))
+        if track_sources:
+            return LoadResult(result, typing.cast("SourceNode", root_node))
         return result
 
     def _normalize_nested_options(self) -> None:

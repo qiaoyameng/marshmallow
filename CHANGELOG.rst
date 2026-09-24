@@ -6,6 +6,12 @@ Changelog
 
 Features:
 
+- Add `Schema.load_with_sources <marshmallow.Schema.load_with_sources>`, an
+  opt-in load that returns a `marshmallow.provenance.LoadResult` recording
+  whether each field was ``supplied``, ``defaulted``, or ``omitted``
+  (based on the post-``pre_load`` input). Sources are queryable through
+  nested schemas, lists, ``many=True``, and ``partial`` loads, and survive
+  ``post_load`` object creation.
 - Simplify `get_value` to match actual usage (:pr:`3024`).
 
 Bug fixes:
