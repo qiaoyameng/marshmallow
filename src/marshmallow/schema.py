@@ -3,6 +3,7 @@
 # ruff: noqa: SLF001
 from __future__ import annotations
 
+import contextlib
 import copy
 import datetime as dt
 import decimal
@@ -18,7 +19,7 @@ from collections import defaultdict
 from collections.abc import Mapping, Sequence
 from itertools import zip_longest
 
-from marshmallow import class_registry, types
+from marshmallow import class_registry, provenance, types
 from marshmallow import fields as ma_fields
 from marshmallow.constants import EXCLUDE, INCLUDE, RAISE, missing
 from marshmallow.decorators import (
@@ -621,22 +622,29 @@ class Schema(metaclass=SchemaMeta):
         instances if `many` is `True`.
         """
         index = index if self.opts.index_errors else None
+        tracker = provenance.current_tracker()
         if many:
             if not is_sequence_but_not_string(data):
                 error_store.store_error([self.error_messages["type"]], index=index)
                 ret_l = []
             else:
-                ret_l = [
-                    self._deserialize(
-                        d,
-                        error_store=error_store,
-                        many=False,
-                        partial=partial,
-                        unknown=unknown,
-                        index=idx,
-                    )
-                    for idx, d in enumerate(data)
-                ]
+                ret_l = []
+                for idx, d in enumerate(data):
+                    if tracker is not None:
+                        ctx = tracker.segment(idx)
+                    else:
+                        ctx = contextlib.nullcontext()
+                    with ctx:
+                        ret_l.append(
+                            self._deserialize(
+                                d,
+                                error_store=error_store,
+                                many=False,
+                                partial=partial,
+                                unknown=unknown,
+                                index=idx,
+                            )
+                        )
             return ret_l
         ret_d = self.dict_class()
         # Check data is a dict
@@ -648,13 +656,25 @@ class Schema(metaclass=SchemaMeta):
                 field_name = (
                     field_obj.data_key if field_obj.data_key is not None else attr_name
                 )
+                key = field_obj.attribute or attr_name
                 raw_value = data.get(field_name, missing)
                 if raw_value is missing:
                     # Ignore missing field if we're allowed to.
                     if partial is True or (
                         partial_is_collection and attr_name in partial
                     ):
+                        if tracker is not None:
+                            tracker.record(key, provenance.OMITTED)
                         continue
+                    if tracker is not None:
+                        source = (
+                            provenance.DEFAULTED
+                            if field_obj.load_default is not missing
+                            else provenance.OMITTED
+                        )
+                        tracker.record(key, source)
+                elif tracker is not None:
+                    tracker.record(key, provenance.SUPPLIED)
                 d_kwargs = {}
                 # Allow partial loading of nested schemas.
                 if partial_is_collection:
@@ -677,15 +697,19 @@ class Schema(metaclass=SchemaMeta):
                         **d_kwargs,
                     )
 
-                value = self._call_and_store(
-                    getter_func=getter,
-                    data=raw_value,
-                    field_name=field_name,
-                    error_store=error_store,
-                    index=index,
-                )
+                if tracker is not None:
+                    ctx = tracker.segment(key)
+                else:
+                    ctx = contextlib.nullcontext()
+                with ctx:
+                    value = self._call_and_store(
+                        getter_func=getter,
+                        data=raw_value,
+                        field_name=field_name,
+                        error_store=error_store,
+                        index=index,
+                    )
                 if value is not missing:
-                    key = field_obj.attribute or attr_name
                     set_value(ret_d, key, value)
             if unknown != EXCLUDE:
                 fields = {
@@ -734,6 +758,69 @@ class Schema(metaclass=SchemaMeta):
         return self._do_load(
             data, many=many, partial=partial, unknown=unknown, postprocess=True
         )
+
+    def load_with_provenance(
+        self,
+        data: Mapping[str, typing.Any] | Sequence[Mapping[str, typing.Any]],
+        *,
+        many: bool | None = None,
+        partial: bool | types.StrSequenceOrSet | None = None,
+        unknown: types.UnknownOption | None = None,
+    ) -> provenance.LoadResult:
+        """Deserialize `data` like `load <marshmallow.Schema.load>`, additionally
+        tracking where each field's value came from.
+
+        This is useful for PATCH-style endpoints that need to distinguish a
+        field that was absent from the request from a field that was
+        explicitly set (including to `None`) or filled in from its
+        ``load_default``.
+
+        Example: ::
+
+            class UserSchema(Schema):
+                name = fields.Str()
+                email = fields.Str(load_default=None)
+
+
+            result = UserSchema().load_with_provenance({"name": "Ada"})
+            result.data  # {'name': 'Ada', 'email': None}
+            result.source("name")  # 'supplied'
+            result.source("email")  # 'defaulted'
+
+        Sources are determined from the input as seen after ``pre_load``
+        processors run. Nested schemas, ``List`` fields, and ``many=True``
+        collections can be queried with dotted paths and integer indices,
+        e.g. ``result.source("friends", 0, "name")``. Paths use output
+        attribute names, so fields whose ``data_key`` or ``attribute``
+        differ from the field name are looked up by their ``attribute``.
+
+        :param data: The data to deserialize.
+        :param many: Whether to deserialize `data` as a collection. If `None`, the
+            value for `self.many` is used.
+        :param partial: Whether to ignore missing fields and not require
+            any fields declared. Propagates down to ``Nested`` fields as well. If
+            its value is an iterable, only missing fields listed in that iterable
+            will be ignored. Use dot delimiters to specify nested fields.
+        :param unknown: Whether to exclude, include, or raise an error for unknown
+            fields in the data. Use `EXCLUDE`, `INCLUDE` or `RAISE`.
+            If `None`, the value for `self.unknown` is used.
+        :return: A `LoadResult <marshmallow.provenance.LoadResult>` wrapping the
+            deserialized data and the per-field sources.
+        :raises ValidationError: If the data is invalid. The sources collected
+            up to the failure are available on the raised exception's
+            ``load_result`` attribute, alongside the existing ``valid_data``.
+
+        .. versionadded:: 4.4.0
+        """
+        with provenance.track_provenance() as tracker:
+            try:
+                result = self._do_load(
+                    data, many=many, partial=partial, unknown=unknown, postprocess=True
+                )
+            except ValidationError as exc:
+                exc.load_result = provenance.LoadResult(exc.valid_data, tracker.records)
+                raise
+        return provenance.LoadResult(result, tracker.records)
 
     def loads(
         self,

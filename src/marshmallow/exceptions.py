@@ -4,6 +4,9 @@ from __future__ import annotations
 
 import typing
 
+if typing.TYPE_CHECKING:
+    from marshmallow.provenance import LoadResult
+
 # Key used for schema-level validation errors
 SCHEMA = "_schema"
 
@@ -22,6 +25,11 @@ class ValidationError(MarshmallowError):
     :param field_name: Field name to store the error on.
     :param data: Raw input data.
     :param valid_data: Valid (de)serialized data.
+
+    .. versionchanged:: 4.4.0
+        Add ``load_result`` attribute, set when a provenance-tracked load via
+        `Schema.load_with_provenance <marshmallow.Schema.load_with_provenance>`
+        fails. It exposes the sources of the valid parts of the input.
     """
 
     def __init__(
@@ -38,6 +46,7 @@ class ValidationError(MarshmallowError):
         self.field_name = field_name
         self.data = data
         self.valid_data = valid_data
+        self.load_result: LoadResult | None = None
         self.kwargs = kwargs
         super().__init__(message)
 

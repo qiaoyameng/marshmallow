@@ -8,14 +8,16 @@ from marshmallow.decorators import (
     validates_schema,
 )
 from marshmallow.exceptions import ValidationError
+from marshmallow.provenance import LoadResult
 from marshmallow.schema import Schema, SchemaOpts
 
-from . import fields
+from . import fields, provenance
 
 __all__ = [
     "EXCLUDE",
     "INCLUDE",
     "RAISE",
+    "LoadResult",
     "Schema",
     "SchemaOpts",
     "ValidationError",
@@ -25,6 +27,7 @@ __all__ = [
     "post_load",
     "pre_dump",
     "pre_load",
+    "provenance",
     "validates",
     "validates_schema",
 ]

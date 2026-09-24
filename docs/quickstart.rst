@@ -395,6 +395,43 @@ You can ignore missing fields entirely by setting ``partial=True``.
     # OR UserSchema(partial=True).load({'age': 42})
     print(result)  # => {'age': 42}
 
+Tracking field provenance
+-------------------------
+
+PATCH-style endpoints often need to distinguish a field that was absent from
+the request from one that was explicitly provided (including as ``null``) or
+filled in from its ``load_default``.
+`Schema.load_with_provenance <marshmallow.Schema.load_with_provenance>` is an
+opt-in variant of `load <marshmallow.Schema.load>` that returns a
+`LoadResult <marshmallow.provenance.LoadResult>` recording the source of
+every field.
+
+.. code-block:: python
+
+    class UserSchema(Schema):
+        name = fields.String(required=True)
+        email = fields.String(load_default=None)
+
+
+    result = UserSchema().load_with_provenance({"name": "Ada"})
+    result.data  # {'name': 'Ada', 'email': None}
+    result.source("name")  # 'supplied'
+    result.source("email")  # 'defaulted'
+
+Sources are determined from the input as seen after ``pre_load`` processors
+run. Nested schemas, lists, and ``many=True`` collections are queried with
+dotted paths and integer indices, using output attribute names.
+
+.. code-block:: python
+
+    result.source("friends", 0, "name")  # OR result.source("friends.0.name")
+
+If validation fails, the sources collected up to the failure are available on
+the raised `ValidationError <marshmallow.exceptions.ValidationError>` via its
+``load_result`` attribute, alongside the existing ``valid_data``.
+
+.. versionadded:: 4.4.0
+
 Specifying defaults
 -------------------
 

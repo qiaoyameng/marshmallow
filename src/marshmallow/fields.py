@@ -28,7 +28,7 @@ except ImportError:
 else:
     MonkeyPatch.patch_fromisoformat()
 
-from marshmallow import class_registry, types, utils, validate
+from marshmallow import class_registry, provenance, types, utils, validate
 from marshmallow.constants import missing as missing_
 from marshmallow.exceptions import (
     StringNotCollectionError,
@@ -781,11 +781,16 @@ class List(Field[list[_InternalT | None]]):
         if not utils.is_collection(value):
             raise self.make_error("invalid")
 
+        tracker = provenance.current_tracker()
         result = []
         errors = {}
         for idx, each in enumerate(value):
             try:
-                result.append(self.inner.deserialize(each, **kwargs))
+                if tracker is not None:
+                    with tracker.segment(idx):
+                        result.append(self.inner.deserialize(each, **kwargs))
+                else:
+                    result.append(self.inner.deserialize(each, **kwargs))
             except ValidationError as error:
                 if error.valid_data is not None:
                     result.append(typing.cast("_InternalT", error.valid_data))
@@ -875,12 +880,17 @@ class Tuple(Field[tuple]):
 
         self.validate_length(value)
 
+        tracker = provenance.current_tracker()
         result = []
         errors = {}
 
         for idx, (field, each) in enumerate(zip(self.tuple_fields, value, strict=True)):
             try:
-                result.append(field.deserialize(each, **kwargs))
+                if tracker is not None:
+                    with tracker.segment(idx):
+                        result.append(field.deserialize(each, **kwargs))
+                else:
+                    result.append(field.deserialize(each, **kwargs))
             except ValidationError as error:
                 if error.valid_data is not None:
                     result.append(error.valid_data)
