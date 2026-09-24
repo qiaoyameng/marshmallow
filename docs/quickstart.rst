@@ -215,6 +215,74 @@ When validating a collection, the errors dictionary will be keyed on the indices
         # {1: {'email': ['Not a valid email address.']},
         #  3: {'name': ['Missing data for required field.']}}
 
+Machine-readable error details
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+The messages in `ValidationError.messages <marshmallow.exceptions.ValidationError.messages>`
+are human-readable, already-formatted English sentences. To hand errors to
+clients written in other languages (or to API clients in general),
+`ValidationError <marshmallow.exceptions.ValidationError>` also exposes
+`ValidationError.details <marshmallow.exceptions.ValidationError.details>`:
+a flat list of :class:`ErrorDetail <marshmallow.ErrorDetail>` objects, one per
+error. Each detail has:
+
+- ``code``: a stable machine-readable identifier, e.g. ``"required"``;
+- ``message``: the formatted message (the same string found in ``messages``);
+- ``params``: the unformatted parameters used to render the message,
+  e.g. ``{"input": -1, "min": 0}``, allowing the client to localize the text;
+- ``path``: the location of the offending value in the raw input as a tuple of
+  data keys and list indices, e.g. ``("items", 2, "quantity")``. Schema-level
+  errors have an empty path.
+
+The path uses the input key (``data_key``) rather than the field name, and
+list indices are never lost. When one field has several errors, every detail
+is kept.
+
+.. code-block:: python
+
+    from marshmallow import Schema, fields, validate
+
+
+    class ItemSchema(Schema):
+        quantity = fields.Int(
+            data_key="quantityAlias", validate=validate.Range(min=1)
+        )
+
+
+    class OrderSchema(Schema):
+        items = fields.List(fields.Nested(ItemSchema))
+
+
+    try:
+        OrderSchema().load({"items": [{"quantityAlias": 0}, {"quantityAlias": "x"}]})
+    except ValidationError as err:
+        pprint(err.messages)
+        # {'items': {0: {'quantityAlias': ['Must be greater than or equal to 1.']},
+        #            1: {'quantityAlias': ['Not a valid integer.']}}}
+        for detail in err.details:
+            print(detail.code, detail.params, detail.path)
+            # range {'input': 0, 'min': 1, 'max': None, ...} ('items', 0, 'quantityAlias')
+            # invalid {'input': 'x'} ('items', 1, 'quantityAlias')
+
+Built-in field failures and built-in validators all provide stable codes
+(``required``, ``null``, ``invalid``, ``unknown``, ``type``, ``range``,
+``length``, ``one_of``, ...). A :class:`ValidationError
+<marshmallow.exceptions.ValidationError>` raised by third-party code with a
+plain string or a dictionary is assigned the default code
+`DEFAULT_ERROR_CODE <marshmallow.DEFAULT_ERROR_CODE>` (``"invalid"``). When
+raising a :class:`ValidationError <marshmallow.exceptions.ValidationError>`
+yourself, you may pass ``code`` and ``params`` explicitly:
+
+.. code-block:: python
+
+    def validate_quantity(value):
+        if value < 0:
+            raise ValidationError(
+                "Quantity must be greater than 0.",
+                code="negative_quantity",
+                params={"input": value, "min": 0},
+            )
+
 You can perform additional validation for a field by passing the ``validate`` argument.
 There are a number of built-in validators in the :ref:`marshmallow.validate <api_validators>` module.
 

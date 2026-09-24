@@ -35,6 +35,7 @@ from marshmallow.exceptions import (
     ValidationError,
     _FieldInstanceResolutionError,
 )
+from marshmallow.error_store import merge_errors
 from marshmallow.validate import And, Length
 
 if typing.TYPE_CHECKING:
@@ -300,7 +301,7 @@ class Field(typing.Generic[_InternalT]):
             raise AssertionError(message) from error
         if isinstance(msg, (str, bytes)):
             msg = msg.format(**kwargs)
-        return ValidationError(msg)
+        return ValidationError(msg, code=key, params=kwargs)
 
     def _validate_missing(self, value: typing.Any) -> None:
         """Validate missing values. Raise a :exc:`ValidationError` if
@@ -643,7 +644,9 @@ class Nested(Field):
             valid_data = self.schema.load(value, unknown=self.unknown, partial=partial)
         except ValidationError as error:
             raise ValidationError(
-                error.messages, valid_data=error.valid_data
+                error.messages,
+                valid_data=error.valid_data,
+                detail_tree=error.detail_tree,
             ) from error
         return valid_data
 
@@ -783,15 +786,21 @@ class List(Field[list[_InternalT | None]]):
 
         result = []
         errors = {}
+        error_details = {}
         for idx, each in enumerate(value):
             try:
                 result.append(self.inner.deserialize(each, **kwargs))
             except ValidationError as error:
                 if error.valid_data is not None:
                     result.append(typing.cast("_InternalT", error.valid_data))
-                errors.update({idx: error.messages})
+                errors = merge_errors(errors, {idx: error.messages})
+                error_details = merge_errors(
+                    error_details, {idx: error.detail_tree}
+                )
         if errors:
-            raise ValidationError(errors, valid_data=result)
+            raise ValidationError(
+                errors, valid_data=result, detail_tree=error_details
+            )
         return result
 
 
@@ -877,6 +886,7 @@ class Tuple(Field[tuple]):
 
         result = []
         errors = {}
+        error_details = {}
 
         for idx, (field, each) in enumerate(zip(self.tuple_fields, value, strict=True)):
             try:
@@ -884,9 +894,14 @@ class Tuple(Field[tuple]):
             except ValidationError as error:
                 if error.valid_data is not None:
                     result.append(error.valid_data)
-                errors.update({idx: error.messages})
+                errors = merge_errors(errors, {idx: error.messages})
+                error_details = merge_errors(
+                    error_details, {idx: error.detail_tree}
+                )
         if errors:
-            raise ValidationError(errors, valid_data=result)
+            raise ValidationError(
+                errors, valid_data=result, detail_tree=error_details
+            )
 
         return tuple(result)
 
@@ -1692,6 +1707,7 @@ class Mapping(Field[_MappingT], metaclass=abc.ABCMeta):
             return self.mapping_type(value)
 
         errors = collections.defaultdict(dict)
+        error_details = collections.defaultdict(dict)
 
         # Deserialize keys
         if self.key_field is None:
@@ -1703,6 +1719,7 @@ class Mapping(Field[_MappingT], metaclass=abc.ABCMeta):
                     keys[key] = self.key_field.deserialize(key, **kwargs)
                 except ValidationError as error:
                     errors[key]["key"] = error.messages
+                    error_details[key]["key"] = error.detail_tree
 
         # Deserialize values
         result = self.mapping_type()
@@ -1716,6 +1733,7 @@ class Mapping(Field[_MappingT], metaclass=abc.ABCMeta):
                     deser_val = self.value_field.deserialize(val, **kwargs)
                 except ValidationError as error:
                     errors[key]["value"] = error.messages
+                    error_details[key]["value"] = error.detail_tree
                     if error.valid_data is not None and key in keys:
                         result[keys[key]] = error.valid_data
                 else:
@@ -1723,7 +1741,11 @@ class Mapping(Field[_MappingT], metaclass=abc.ABCMeta):
                         result[keys[key]] = deser_val
 
         if errors:
-            raise ValidationError(errors, valid_data=result)
+            raise ValidationError(
+                dict(errors),
+                valid_data=result,
+                detail_tree=dict(error_details),
+            )
 
         return result
 

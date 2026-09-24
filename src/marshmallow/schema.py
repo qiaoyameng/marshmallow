@@ -30,7 +30,12 @@ from marshmallow.decorators import (
     VALIDATES_SCHEMA,
 )
 from marshmallow.error_store import ErrorStore
-from marshmallow.exceptions import SCHEMA, StringNotCollectionError, ValidationError
+from marshmallow.exceptions import (
+    SCHEMA,
+    ErrorDetail,
+    StringNotCollectionError,
+    ValidationError,
+)
 from marshmallow.orderedset import OrderedSet
 from marshmallow.utils import (
     get_value,
@@ -521,7 +526,12 @@ class Schema(metaclass=SchemaMeta):
         try:
             value = getter_func(data)
         except ValidationError as error:
-            error_store.store_error(error.messages, field_name, index=index)
+            error_store.store_error(
+                error.messages,
+                field_name,
+                index=index,
+                detail_tree=error.detail_tree,
+            )
             # When a Nested field fails validation, the marshalled data is stored
             # on the ValidationError's valid_data attribute
             return error.valid_data or missing
@@ -623,7 +633,17 @@ class Schema(metaclass=SchemaMeta):
         index = index if self.opts.index_errors else None
         if many:
             if not is_sequence_but_not_string(data):
-                error_store.store_error([self.error_messages["type"]], index=index)
+                error_store.store_error(
+                    [self.error_messages["type"]],
+                    index=index,
+                    detail_tree=[
+                        ErrorDetail(
+                            code="type",
+                            message=self.error_messages["type"],
+                            params={"input": data},
+                        )
+                    ],
+                )
                 ret_l = []
             else:
                 ret_l = [
@@ -641,7 +661,17 @@ class Schema(metaclass=SchemaMeta):
         ret_d = self.dict_class()
         # Check data is a dict
         if not isinstance(data, Mapping):
-            error_store.store_error([self.error_messages["type"]], index=index)
+            error_store.store_error(
+                [self.error_messages["type"]],
+                index=index,
+                detail_tree=[
+                    ErrorDetail(
+                        code="type",
+                        message=self.error_messages["type"],
+                        params={"input": data},
+                    )
+                ],
+            )
         else:
             partial_is_collection = is_collection(partial)
             for attr_name, field_obj in self.load_fields.items():
@@ -701,6 +731,13 @@ class Schema(metaclass=SchemaMeta):
                             [self.error_messages["unknown"]],
                             key,
                             index,
+                            detail_tree=[
+                                ErrorDetail(
+                                    code="unknown",
+                                    message=self.error_messages["unknown"],
+                                    params={"input": key},
+                                )
+                            ],
                         )
         return ret_d
 
@@ -810,7 +847,12 @@ class Schema(metaclass=SchemaMeta):
                     )
                 else:
                     data_key = field_name
-            error_store.store_error(err.messages, data_key, index=index)
+            error_store.store_error(
+                err.messages,
+                data_key,
+                index=index,
+                detail_tree=err.detail_tree,
+            )
 
     def validate(
         self,
@@ -866,6 +908,7 @@ class Schema(metaclass=SchemaMeta):
         """
         error_store = ErrorStore()
         errors: dict[str, list[str]] = {}
+        error_details: dict[str, typing.Any] = {}
         many = self.many if many is None else bool(many)
         unknown = self.unknown if unknown is None else unknown
         if partial is None:
@@ -883,6 +926,7 @@ class Schema(metaclass=SchemaMeta):
                 )
             except ValidationError as err:
                 errors = err.normalized_messages()
+                error_details = err.normalized_detail_tree()
                 result: list | dict | None = None
         else:
             processed_data = data
@@ -923,6 +967,7 @@ class Schema(metaclass=SchemaMeta):
                     field_errors=field_errors,
                 )
             errors = error_store.errors
+            error_details = error_store.error_details
             # Run post processors
             if not errors and postprocess and self._hooks[POST_LOAD]:
                 try:
@@ -936,8 +981,14 @@ class Schema(metaclass=SchemaMeta):
                     )
                 except ValidationError as err:
                     errors = err.normalized_messages()
+                    error_details = err.normalized_detail_tree()
         if errors:
-            exc = ValidationError(errors, data=data, valid_data=result)
+            exc = ValidationError(
+                errors,
+                data=data,
+                valid_data=result,
+                detail_tree=error_details,
+            )
             self.handle_error(exc, data, many=many, partial=partial)
             raise exc
 

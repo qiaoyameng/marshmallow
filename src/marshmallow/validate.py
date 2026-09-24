@@ -7,7 +7,7 @@ import typing
 from abc import ABC, abstractmethod
 from operator import attrgetter
 
-from marshmallow.exceptions import ValidationError
+from marshmallow.exceptions import DEFAULT_ERROR_CODE, ValidationError
 
 if typing.TYPE_CHECKING:
     from marshmallow import types
@@ -26,6 +26,9 @@ class Validator(ABC):
 
     error: str | None = None
 
+    #: Stable machine-readable error code used when this validator fails.
+    default_code: str = DEFAULT_ERROR_CODE
+
     def __repr__(self) -> str:
         args = self._repr_args()
         args = f"{args}, " if args else ""
@@ -40,6 +43,12 @@ class Validator(ABC):
 
     @abstractmethod
     def __call__(self, value: typing.Any) -> typing.Any: ...
+
+    def make_error(self, message: str, **params: typing.Any) -> ValidationError:
+        """Build a :class:`ValidationError` carrying this validator's stable
+        ``code`` and the unformatted ``params`` used to render ``message``.
+        """
+        return ValidationError(message, code=self.default_code, params=params)
 
 
 class And(Validator):
@@ -70,6 +79,7 @@ class And(Validator):
 
     def __call__(self, value: typing.Any) -> typing.Any:
         errors: list[str | dict] = []
+        detail_tree: list[typing.Any] = []
         kwargs: dict[str, typing.Any] = {}
         for validator in self.validators:
             try:
@@ -78,10 +88,18 @@ class And(Validator):
                 kwargs.update(err.kwargs)
                 if isinstance(err.messages, dict):
                     errors.append(err.messages)
+                    detail_tree.append(err.detail_tree)
                 else:
                     errors.extend(err.messages)
+                    detail_tree.extend(
+                        err.detail_tree
+                        if isinstance(err.detail_tree, list)
+                        else [err.detail_tree]
+                    )
         if errors:
-            raise ValidationError(errors, **kwargs)
+            raise ValidationError(
+                errors, detail_tree=detail_tree, **kwargs
+            )
         return value
 
 
@@ -96,6 +114,8 @@ class URL(Validator):
         ``ftp``, and ``ftps`` are allowed.
     :param require_tld: Whether to reject non-FQDN hostnames.
     """
+
+    default_code = "invalid_url"
 
     class RegexMemoizer:
         def __init__(self):
@@ -217,15 +237,16 @@ class URL(Validator):
 
     def __call__(self, value: str) -> str:
         message = self._format_error(value)
+        params = {"input": value}
         if not value:
-            raise ValidationError(message)
+            raise self.make_error(message, **params)
 
         # Check first if the scheme is valid
         scheme = None
         if "://" in value:
             scheme = value.split("://", maxsplit=1)[0].lower()
             if scheme not in self.schemes:
-                raise ValidationError(message)
+                raise self.make_error(message, scheme=scheme, **params)
 
         regex = self._regex(
             relative=self.relative, absolute=self.absolute, require_tld=self.require_tld
@@ -239,7 +260,7 @@ class URL(Validator):
             matched = regex.search(value)
 
         if not matched:
-            raise ValidationError(message)
+            raise self.make_error(message, **params)
 
         return value
 
@@ -250,6 +271,8 @@ class Email(Validator):
     :param error: Error message to raise in case of a validation error. Can be
         interpolated with `{input}`.
     """
+
+    default_code = "invalid_email"
 
     USER_REGEX = re.compile(
         r"(^[-!#$%&'*+/=?^`{}|~\w]+(\.[-!#$%&'*+/=?^`{}|~\w]+)*\Z"  # dot-atom
@@ -284,18 +307,19 @@ class Email(Validator):
 
     def __call__(self, value: str) -> str:
         message = self._format_error(value)
+        params = {"input": value}
 
         if not value or "@" not in value:
-            raise ValidationError(message)
+            raise self.make_error(message, **params)
 
         user_part, domain_part = value.rsplit("@", 1)
 
         if not self.USER_REGEX.match(user_part):
-            raise ValidationError(message)
+            raise self.make_error(message, **params)
 
         if domain_part not in self.DOMAIN_WHITELIST:
             if not self.DOMAIN_REGEX.match(domain_part):
-                raise ValidationError(message)
+                raise self.make_error(message, **params)
 
         return value
 
@@ -318,6 +342,8 @@ class Range(Validator):
     :param error: Error message to raise in case of a validation error.
         Can be interpolated with `{input}`, `{min}` and `{max}`.
     """
+
+    default_code = "range"
 
     message_min = "Must be {min_op} {{min}}."
     message_max = "Must be {max_op} {{max}}."
@@ -366,13 +392,27 @@ class Range(Validator):
             value < self.min if self.min_inclusive else value <= self.min
         ):
             message = self.message_min if self.max is None else self.message_all
-            raise ValidationError(self._format_error(value, message))
+            raise self.make_error(
+                self._format_error(value, message),
+                input=value,
+                min=self.min,
+                max=self.max,
+                min_inclusive=self.min_inclusive,
+                max_inclusive=self.max_inclusive,
+            )
 
         if self.max is not None and (
             value > self.max if self.max_inclusive else value >= self.max
         ):
             message = self.message_max if self.min is None else self.message_all
-            raise ValidationError(self._format_error(value, message))
+            raise self.make_error(
+                self._format_error(value, message),
+                input=value,
+                min=self.min,
+                max=self.max,
+                min_inclusive=self.min_inclusive,
+                max_inclusive=self.max_inclusive,
+            )
 
         return value
 
@@ -394,6 +434,8 @@ class Length(Validator):
     :param error: Error message to raise in case of a validation error.
         Can be interpolated with `{input}`, `{min}` and `{max}`.
     """
+
+    default_code = "length"
 
     message_min = "Shorter than minimum length {min}."
     message_max = "Longer than maximum length {max}."
@@ -432,16 +474,34 @@ class Length(Validator):
 
         if self.equal is not None:
             if length != self.equal:
-                raise ValidationError(self._format_error(value, self.message_equal))
+                raise self.make_error(
+                    self._format_error(value, self.message_equal),
+                    input=value,
+                    min=self.min,
+                    max=self.max,
+                    equal=self.equal,
+                )
             return value
 
         if self.min is not None and length < self.min:
             message = self.message_min if self.max is None else self.message_all
-            raise ValidationError(self._format_error(value, message))
+            raise self.make_error(
+                self._format_error(value, message),
+                input=value,
+                min=self.min,
+                max=self.max,
+                equal=self.equal,
+            )
 
         if self.max is not None and length > self.max:
             message = self.message_max if self.min is None else self.message_all
-            raise ValidationError(self._format_error(value, message))
+            raise self.make_error(
+                self._format_error(value, message),
+                input=value,
+                min=self.min,
+                max=self.max,
+                equal=self.equal,
+            )
 
         return value
 
@@ -456,6 +516,7 @@ class Equal(Validator):
     """
 
     default_message = "Must be equal to {other}."
+    default_code = "equal"
 
     def __init__(self, comparable, *, error: str | None = None):
         self.comparable = comparable
@@ -469,7 +530,9 @@ class Equal(Validator):
 
     def __call__(self, value: _T) -> _T:
         if value != self.comparable:
-            raise ValidationError(self._format_error(value))
+            raise self.make_error(
+                self._format_error(value), input=value, other=self.comparable
+            )
         return value
 
 
@@ -489,6 +552,7 @@ class Regexp(Validator):
     """
 
     default_message = "String does not match expected pattern."
+    default_code = "regexp"
 
     def __init__(
         self,
@@ -516,7 +580,9 @@ class Regexp(Validator):
 
     def __call__(self, value):
         if self.regex.match(value) is None:
-            raise ValidationError(self._format_error(value))
+            raise self.make_error(
+                self._format_error(value), input=value, regex=self.regex.pattern
+            )
 
         return value
 
@@ -534,6 +600,7 @@ class Predicate(Validator):
     """
 
     default_message = "Invalid input."
+    default_code = "predicate"
 
     def __init__(self, method: str, *, error: str | None = None, **kwargs):
         self.method = method
@@ -550,7 +617,12 @@ class Predicate(Validator):
         method = getattr(value, self.method)
 
         if not method(**self.kwargs):
-            raise ValidationError(self._format_error(value))
+            raise self.make_error(
+                self._format_error(value),
+                input=value,
+                method=self.method,
+                kwargs=dict(self.kwargs),
+            )
 
         return value
 
@@ -564,6 +636,7 @@ class NoneOf(Validator):
     """
 
     default_message = "Invalid input."
+    default_code = "none_of"
 
     def __init__(self, iterable: typing.Iterable, *, error: str | None = None):
         self.iterable = iterable
@@ -579,7 +652,11 @@ class NoneOf(Validator):
     def __call__(self, value: typing.Any) -> typing.Any:
         try:
             if value in self.iterable:
-                raise ValidationError(self._format_error(value))
+                raise self.make_error(
+                    self._format_error(value),
+                    input=value,
+                    values=list(self.iterable),
+                )
         except TypeError:
             pass
 
@@ -596,6 +673,7 @@ class OneOf(Validator):
     """
 
     default_message = "Must be one of: {choices}."
+    default_code = "one_of"
 
     def __init__(
         self,
@@ -621,9 +699,19 @@ class OneOf(Validator):
     def __call__(self, value: typing.Any) -> typing.Any:
         try:
             if value not in self.choices:
-                raise ValidationError(self._format_error(value))
+                raise self.make_error(
+                    self._format_error(value),
+                    input=value,
+                    choices=list(self.choices),
+                    labels=list(self.labels),
+                )
         except TypeError as error:
-            raise ValidationError(self._format_error(value)) from error
+            raise self.make_error(
+                self._format_error(value),
+                input=value,
+                choices=list(self.choices),
+                labels=list(self.labels),
+            ) from error
 
         return value
 
@@ -671,6 +759,7 @@ class ContainsOnly(OneOf):
     """
 
     default_message = "One or more of the choices you made was not in: {choices}."
+    default_code = "contains_only"
 
     def _format_error(self, value: typing.Sequence[typing.Any]) -> str:
         value_text = ", ".join(str(val) for val in value)
@@ -680,7 +769,12 @@ class ContainsOnly(OneOf):
         # We can't use set.issubset because does not handle unhashable types
         for val in value:
             if val not in self.choices:
-                raise ValidationError(self._format_error(value))
+                raise self.make_error(
+                    self._format_error(value),
+                    input=list(value),
+                    choices=list(self.choices),
+                    labels=list(self.labels),
+                )
         return value
 
 
@@ -696,6 +790,7 @@ class ContainsNoneOf(NoneOf):
     """
 
     default_message = "One or more of the choices you made was in: {values}."
+    default_code = "contains_none_of"
 
     def _format_error(self, value: typing.Sequence[typing.Any]) -> str:
         value_text = ", ".join(str(val) for val in value)
@@ -704,5 +799,9 @@ class ContainsNoneOf(NoneOf):
     def __call__(self, value: typing.Sequence[_T]) -> typing.Sequence[_T]:
         for val in value:
             if val in self.iterable:
-                raise ValidationError(self._format_error(value))
+                raise self.make_error(
+                    self._format_error(value),
+                    input=list(value),
+                    values=list(self.iterable),
+                )
         return value

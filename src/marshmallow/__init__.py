@@ -7,12 +7,14 @@ from marshmallow.decorators import (
     validates,
     validates_schema,
 )
-from marshmallow.exceptions import ValidationError
+from marshmallow.exceptions import DEFAULT_ERROR_CODE, ErrorDetail, ValidationError
 from marshmallow.schema import Schema, SchemaOpts
 
 from . import fields
 
 __all__ = [
+    "DEFAULT_ERROR_CODE",
+    "ErrorDetail",
     "EXCLUDE",
     "INCLUDE",
     "RAISE",

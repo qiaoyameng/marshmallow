@@ -7,6 +7,19 @@ Changelog
 Features:
 
 - Simplify `get_value` to match actual usage (:pr:`3024`).
+- `ValidationError <marshmallow.exceptions.ValidationError>` now carries
+  machine-readable error details via the new
+  `ValidationError.details <marshmallow.exceptions.ValidationError.details>`
+  attribute: each :class:`ErrorDetail <marshmallow.ErrorDetail>` exposes a
+  stable ``code``, unformatted ``params`` and the input ``path`` (using data
+  keys and list indices). Details are preserved for built-in fields,
+  validators (including `validate.And <marshmallow.validate.And>`),
+  `Nested <marshmallow.fields.Nested>`, `List <marshmallow.fields.List>`,
+  `Tuple <marshmallow.fields.Tuple>`, `Mapping
+  <marshmallow.fields.Mapping>` and schema-level validation. Plain string or
+  dict errors get the default code `DEFAULT_ERROR_CODE
+  <marshmallow.DEFAULT_ERROR_CODE>` (``"invalid"``). ``messages`` and
+  ``str(error)`` are unchanged.
 
 Bug fixes:
 
