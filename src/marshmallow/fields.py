@@ -52,6 +52,7 @@ __all__ = [
     "Date",
     "DateTime",
     "Decimal",
+    "DiscriminatedUnion",
     "Dict",
     "Email",
     "Enum",
@@ -727,6 +728,184 @@ class Pluck(Nested):
         else:
             value = {self._field_data_key: value}
         return self._load(value, partial=partial)
+
+
+class DiscriminatedUnion(Field):
+    """A field that dispatches to one of several
+    `Schema <marshmallow.Schema>` branches based on the value of a
+    discriminator key (e.g. ``"kind"``).
+
+    On deserialization, only the branch registered for the discriminator
+    value is loaded. A missing discriminator and an unregistered
+    discriminator value raise distinct errors; no other branch is tried.
+
+    On serialization, the branch is selected through an explicit
+    ``dump_types`` mapping of Python type to discriminator label, never by
+    trying branches in registration order. Objects whose exact type is not
+    registered are rejected.
+
+    The discriminator key is removed from a *copy* of the input before it is
+    passed to the selected branch (the input dictionary is never mutated),
+    and is injected into the output on serialization.
+
+    Example: ::
+
+        class EmailSchema(Schema):
+            address = fields.Email()
+            subject = fields.Str(required=True)
+
+
+        class WebhookSchema(Schema):
+            url = fields.Url()
+            retries = fields.Int(load_default=0)
+
+
+        class MessageSchema(Schema):
+            message = fields.DiscriminatedUnion(
+                {"email": EmailSchema, "webhook": WebhookSchema},
+                discriminator="kind",
+                dump_types={EmailMessage: "email", WebhookMessage: "webhook"},
+            )
+
+    :param schemas: A mapping of discriminator label to
+        `Schema <marshmallow.Schema>` instance, class, class name (string),
+        or callable that returns a `Schema <marshmallow.Schema>` or class.
+    :param discriminator: The key in the input data whose value selects the
+        branch. Defaults to ``"kind"``.
+    :param dump_types: A mapping of Python type to discriminator label, used
+        to select the branch during serialization. Required for dumping.
+    :param unknown: Whether to exclude, include, or raise an error for
+        unknown fields in the data. Use `EXCLUDE`, `INCLUDE` or `RAISE`.
+        Propagated to the selected branch.
+    :param kwargs: The same keyword arguments that :class:`Field` receives.
+
+    .. versionadded:: 4.4.0
+    """
+
+    #: Default error messages.
+    default_error_messages = {
+        "invalid": "Invalid type.",
+        "missing_discriminator": "Missing discriminator field {discriminator!r}.",
+        "unknown_discriminator": (
+            "Unknown discriminator value {value!r} for field {discriminator!r}."
+        ),
+        "unknown_dump_type": "No branch registered for objects of type {type!r}.",
+    }
+
+    def __init__(
+        self,
+        schemas: (
+            typing.Mapping[
+                typing.Hashable,
+                Schema
+                | SchemaMeta
+                | str
+                | typing.Callable[[], Schema | SchemaMeta | str],
+            ]
+        ),
+        *,
+        discriminator: str = "kind",
+        dump_types: typing.Mapping[type, typing.Hashable] | None = None,
+        unknown: types.UnknownOption | None = None,
+        **kwargs: Unpack[_BaseFieldKwargs],
+    ):
+        if not isinstance(schemas, _Mapping) or not schemas:
+            raise ValueError(
+                "`DiscriminatedUnion` fields must be passed a non-empty "
+                "mapping of discriminator label to `Schema`."
+            )
+        self.schemas = dict(schemas)
+        self.discriminator = discriminator
+        self.dump_types = dict(dump_types) if dump_types is not None else None
+        if self.dump_types is not None:
+            unknown_labels = set(self.dump_types.values()) - set(self.schemas)
+            if unknown_labels:
+                raise ValueError(
+                    "`dump_types` contains labels that are not registered "
+                    f"in `schemas`: {sorted(unknown_labels)!r}."
+                )
+        self.unknown = unknown
+        self._branch_schemas: dict[typing.Hashable, Schema] | None = None
+        super().__init__(**kwargs)
+
+    @property
+    def branch_schemas(self) -> dict[typing.Hashable, Schema]:
+        """The resolved mapping of discriminator label to `Schema` instance."""
+        if self._branch_schemas is None:
+            # defer the import of `marshmallow.schema` to avoid circular imports
+            from marshmallow.schema import Schema, SchemaMeta  # noqa: PLC0415
+
+            resolved = {}
+            for label, nested in self.schemas.items():
+                if callable(nested) and not isinstance(nested, (SchemaMeta, Schema)):
+                    nested = nested()
+                if isinstance(nested, Schema):
+                    resolved[label] = nested
+                elif isinstance(nested, type) and issubclass(nested, Schema):
+                    resolved[label] = nested()
+                elif isinstance(nested, str):
+                    resolved[label] = class_registry.get_class(nested, all=False)()
+                else:
+                    raise ValueError(
+                        "`DiscriminatedUnion` branches must be a `Schema` "
+                        f"instance, class, class name, or callable, not "
+                        f"{nested.__class__}."
+                    )
+            self._branch_schemas = resolved
+        return self._branch_schemas
+
+    def _select_branch(self, value: _Mapping) -> Schema:
+        if self.discriminator not in value:
+            raise self.make_error(
+                "missing_discriminator", discriminator=self.discriminator
+            )
+        label = value[self.discriminator]
+        try:
+            schema = self.branch_schemas.get(label)
+        except TypeError as error:
+            raise self.make_error(
+                "unknown_discriminator",
+                value=label,
+                discriminator=self.discriminator,
+            ) from error
+        if schema is None:
+            raise self.make_error(
+                "unknown_discriminator",
+                value=label,
+                discriminator=self.discriminator,
+            )
+        return schema
+
+    def _serialize(self, value, attr, obj, **kwargs):
+        if value is None:
+            return None
+        if self.dump_types is None:
+            raise ValueError(
+                "Cannot dump with a `DiscriminatedUnion` field that was not "
+                "given a `dump_types` mapping."
+            )
+        label = self.dump_types.get(type(value), missing_)
+        if label is missing_:
+            raise self.make_error("unknown_dump_type", type=type(value).__name__)
+        ret = self.branch_schemas[label].dump(value)
+        # Inject the discriminator into a new dict; never mutate the dump output
+        # of the branch in place.
+        return {**ret, self.discriminator: label}
+
+    def _deserialize(self, value, attr, data, partial=None, **kwargs):
+        if not isinstance(value, _Mapping):
+            raise self.make_error("invalid", input=value)
+        schema = self._select_branch(value)
+        # Delegate to a copy of the input without the discriminator key so the
+        # caller's dictionary is never mutated and branches need not redeclare
+        # the discriminator field.
+        branch_input = {k: v for k, v in value.items() if k != self.discriminator}
+        try:
+            return schema.load(branch_input, unknown=self.unknown, partial=partial)
+        except ValidationError as error:
+            raise ValidationError(
+                error.messages, valid_data=error.valid_data
+            ) from error
 
 
 class List(Field[list[_InternalT | None]]):

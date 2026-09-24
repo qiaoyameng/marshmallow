@@ -6,6 +6,10 @@ Changelog
 
 Features:
 
+- Add `DiscriminatedUnion <marshmallow.fields.DiscriminatedUnion>` field for
+  polymorphic (de)serialization. A discriminator key (e.g. ``"kind"``) selects
+  the branch schema on load, and an explicit ``dump_types`` mapping selects
+  the branch on dump.
 - Simplify `get_value` to match actual usage (:pr:`3024`).
 
 Bug fixes:
