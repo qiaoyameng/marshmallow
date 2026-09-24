@@ -30,6 +30,7 @@ else:
 
 from marshmallow import class_registry, types, utils, validate
 from marshmallow.constants import missing as missing_
+from marshmallow.error_store import merge_errors, prepend_detail_paths
 from marshmallow.exceptions import (
     StringNotCollectionError,
     ValidationError,
@@ -300,16 +301,16 @@ class Field(typing.Generic[_InternalT]):
             raise AssertionError(message) from error
         if isinstance(msg, (str, bytes)):
             msg = msg.format(**kwargs)
-        return ValidationError(msg)
+        return ValidationError(msg, code=key, params=kwargs)
 
     def _validate_missing(self, value: typing.Any) -> None:
         """Validate missing values. Raise a :exc:`ValidationError` if
         `value` should be considered missing.
         """
         if value is missing_ and self.required:
-            raise self.make_error("required")
+            raise self.make_error("required", field=self.name)
         if value is None and not self.allow_none:
-            raise self.make_error("null")
+            raise self.make_error("null", input=value)
 
     def serialize(
         self,
@@ -643,7 +644,9 @@ class Nested(Field):
             valid_data = self.schema.load(value, unknown=self.unknown, partial=partial)
         except ValidationError as error:
             raise ValidationError(
-                error.messages, valid_data=error.valid_data
+                error.messages,
+                valid_data=error.valid_data,
+                details=error.details,
             ) from error
         return valid_data
 
@@ -779,19 +782,21 @@ class List(Field[list[_InternalT | None]]):
 
     def _deserialize(self, value, attr, data, **kwargs) -> list[_InternalT | None]:
         if not utils.is_collection(value):
-            raise self.make_error("invalid")
+            raise self.make_error("invalid", input=value)
 
         result = []
         errors = {}
+        details = []
         for idx, each in enumerate(value):
             try:
                 result.append(self.inner.deserialize(each, **kwargs))
             except ValidationError as error:
                 if error.valid_data is not None:
                     result.append(typing.cast("_InternalT", error.valid_data))
-                errors.update({idx: error.messages})
+                errors = merge_errors(errors, {idx: error.messages})
+                details.extend(prepend_detail_paths(error.details, [idx]))
         if errors:
-            raise ValidationError(errors, valid_data=result)
+            raise ValidationError(errors, valid_data=result, details=details)
         return result
 
 
@@ -871,12 +876,13 @@ class Tuple(Field[tuple]):
         **kwargs,
     ) -> tuple:
         if not utils.is_sequence_but_not_string(value):
-            raise self.make_error("invalid")
+            raise self.make_error("invalid", input=value)
 
         self.validate_length(value)
 
         result = []
         errors = {}
+        details = []
 
         for idx, (field, each) in enumerate(zip(self.tuple_fields, value, strict=True)):
             try:
@@ -884,9 +890,10 @@ class Tuple(Field[tuple]):
             except ValidationError as error:
                 if error.valid_data is not None:
                     result.append(error.valid_data)
-                errors.update({idx: error.messages})
+                errors = merge_errors(errors, {idx: error.messages})
+                details.extend(prepend_detail_paths(error.details, [idx]))
         if errors:
-            raise ValidationError(errors, valid_data=result)
+            raise ValidationError(errors, valid_data=result, details=details)
 
         return tuple(result)
 
@@ -910,11 +917,11 @@ class String(Field[str]):
 
     def _deserialize(self, value, attr, data, **kwargs) -> str:
         if not isinstance(value, (str, bytes)):
-            raise self.make_error("invalid")
+            raise self.make_error("invalid", input=value)
         try:
             return utils.ensure_text_type(value)
         except UnicodeDecodeError as error:
-            raise self.make_error("invalid_utf8") from error
+            raise self.make_error("invalid_utf8", input=value) from error
 
 
 class UUID(Field[uuid.UUID]):
@@ -932,7 +939,7 @@ class UUID(Field[uuid.UUID]):
                 return uuid.UUID(bytes=value)
             return uuid.UUID(value)
         except (ValueError, AttributeError, TypeError) as error:
-            raise self.make_error("invalid_uuid") from error
+            raise self.make_error("invalid_uuid", input=value) from error
 
     def _serialize(self, value, attr, obj, **kwargs) -> str | None:
         if value is None:
@@ -1064,7 +1071,7 @@ class Float(Number[float]):
         num = super()._validated(value)
         if self.allow_nan is False:
             if math.isnan(num) or num == float("inf") or num == float("-inf"):
-                raise self.make_error("special")
+                raise self.make_error("special", input=value)
         return num
 
 
@@ -1141,9 +1148,9 @@ class Decimal(Number[decimal.Decimal]):
         try:
             num = super()._validated(value)
         except decimal.InvalidOperation as error:
-            raise self.make_error("invalid") from error
+            raise self.make_error("invalid", input=value) from error
         if not self.allow_nan and (num.is_nan() or num.is_infinite()):
-            raise self.make_error("special")
+            raise self.make_error("special", input=value)
         return num
 
     # override Number
@@ -1383,6 +1390,7 @@ class NaiveDateTime(DateTime):
             if self.timezone is None:
                 raise self.make_error(
                     "invalid_awareness",
+                    input=value,
                     awareness=self.AWARENESS,
                     obj_type=self.OBJ_TYPE,
                 )
@@ -1420,6 +1428,7 @@ class AwareDateTime(DateTime):
             if self.default_timezone is None:
                 raise self.make_error(
                     "invalid_awareness",
+                    input=value,
                     awareness=self.AWARENESS,
                     obj_type=self.OBJ_TYPE,
                 )
@@ -1575,7 +1584,7 @@ class TimeDelta(Field[dt.timedelta]):
         try:
             value = float(value)
         except (TypeError, ValueError) as error:
-            raise self.make_error("invalid") from error
+            raise self.make_error("invalid", input=value) from error
 
         kwargs = {self.precision: value}
 
@@ -1584,7 +1593,7 @@ class TimeDelta(Field[dt.timedelta]):
         except (OverflowError, ValueError) as error:
             # OverflowError: value out of timedelta's range (e.g. infinity).
             # ValueError: value is NaN.
-            raise self.make_error("invalid") from error
+            raise self.make_error("invalid", input=value) from error
 
 
 _MappingT = typing.TypeVar("_MappingT", bound=_Mapping)
@@ -1687,11 +1696,12 @@ class Mapping(Field[_MappingT], metaclass=abc.ABCMeta):
 
     def _deserialize(self, value, attr, data, **kwargs):
         if not isinstance(value, _Mapping):
-            raise self.make_error("invalid")
+            raise self.make_error("invalid", input=value)
         if not self.value_field and not self.key_field:
             return self.mapping_type(value)
 
         errors = collections.defaultdict(dict)
+        details = []
 
         # Deserialize keys
         if self.key_field is None:
@@ -1703,6 +1713,7 @@ class Mapping(Field[_MappingT], metaclass=abc.ABCMeta):
                     keys[key] = self.key_field.deserialize(key, **kwargs)
                 except ValidationError as error:
                     errors[key]["key"] = error.messages
+                    details.extend(prepend_detail_paths(error.details, [key, "key"]))
 
         # Deserialize values
         result = self.mapping_type()
@@ -1716,6 +1727,7 @@ class Mapping(Field[_MappingT], metaclass=abc.ABCMeta):
                     deser_val = self.value_field.deserialize(val, **kwargs)
                 except ValidationError as error:
                     errors[key]["value"] = error.messages
+                    details.extend(prepend_detail_paths(error.details, [key, "value"]))
                     if error.valid_data is not None and key in keys:
                         result[keys[key]] = error.valid_data
                 else:
@@ -1723,7 +1735,7 @@ class Mapping(Field[_MappingT], metaclass=abc.ABCMeta):
                         result[keys[key]] = deser_val
 
         if errors:
-            raise ValidationError(errors, valid_data=result)
+            raise ValidationError(errors, valid_data=result, details=details)
 
         return result
 
@@ -1836,7 +1848,7 @@ class IP(Field[ipaddress.IPv4Address | ipaddress.IPv6Address]):
                 utils.ensure_text_type(value)
             )
         except (ValueError, TypeError) as error:
-            raise self.make_error("invalid_ip") from error
+            raise self.make_error("invalid_ip", input=value) from error
 
 
 class IPv4(IP):
@@ -1898,7 +1910,7 @@ class IPInterface(Field[ipaddress.IPv4Interface | ipaddress.IPv6Interface]):
                 utils.ensure_text_type(value)
             )
         except (ValueError, TypeError) as error:
-            raise self.make_error("invalid_ip_interface") from error
+            raise self.make_error("invalid_ip_interface", input=value) from error
 
 
 class IPv4Interface(IPInterface):
@@ -1993,11 +2005,21 @@ class Enum(Field[_EnumT]):
             try:
                 return self.enum(val)
             except ValueError as error:
-                raise self.make_error("unknown", choices=self.choices_text) from error
+                raise self.make_error(
+                    "unknown",
+                    input=value,
+                    choices=tuple(self.enum),
+                    choices_text=self.choices_text,
+                ) from error
         try:
             ret = self.enum[val]
         except KeyError as error:
-            raise self.make_error("unknown", choices=self.choices_text) from error
+            raise self.make_error(
+                "unknown",
+                input=value,
+                choices=tuple(self.enum),
+                choices_text=self.choices_text,
+            ) from error
         return ret
 
 
@@ -2136,7 +2158,7 @@ class Constant(Field[_ContantT]):
         # Omit check for value is missing_
         # Below is just a paranoid check
         if value is None and not self.allow_none:
-            raise self.make_error("null")
+            raise self.make_error("null", input=value)
 
     def _serialize(self, value, *args, **kwargs) -> _ContantT:
         return self.constant

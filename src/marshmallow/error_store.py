@@ -6,15 +6,17 @@
     Users should not need to use this module directly.
 """
 
-from marshmallow.exceptions import SCHEMA
+from marshmallow.exceptions import SCHEMA, ValidationError
 
 
 class ErrorStore:
     def __init__(self):
         #: Dictionary of errors stored during serialization
         self.errors = {}
+        #: Program-readable details for errors stored during serialization
+        self.details: list[ValidationError.details] = []
 
-    def store_error(self, messages, field_name=SCHEMA, index=None):
+    def store_error(self, messages, field_name=SCHEMA, index=None, details=None):
         # field error  -> store/merge error messages under field name key
         # schema error -> if string or list, store/merge under _schema key
         #              -> if dict, store/merge with other top-level keys
@@ -23,7 +25,25 @@ class ErrorStore:
             messages = {field_name: messages}
         if index is not None:
             messages = {index: messages}
+        if details is None:
+            details = ValidationError._details_from_messages(messages)
+        path = [*(() if index is None else (index,))]
+        if field_name != SCHEMA:
+            path.append(field_name)
+        details = prepend_detail_paths(details, path)
         self.errors = merge_errors(self.errors, messages)
+        self.details.extend(copy_containers(details))
+
+
+def prepend_detail_paths(details, path):
+    return [
+        {
+            **detail,
+            "params": copy_containers(detail.get("params", {})),
+            "path": [*path, *detail.get("path", [])],
+        }
+        for detail in details
+    ]
 
 
 def copy_containers(errors):
