@@ -53,6 +53,7 @@ __all__ = [
     "DateTime",
     "Decimal",
     "Dict",
+    "DiscriminatedUnion",
     "Email",
     "Enum",
     "Field",
@@ -727,6 +728,180 @@ class Pluck(Nested):
         else:
             value = {self._field_data_key: value}
         return self._load(value, partial=partial)
+
+
+class DiscriminatedUnion(Field):
+    """A field that (de)serializes a union of schemas, selecting exactly one
+    branch by the value of a discriminator (a.k.a. "tag") field.
+
+    On load, the discriminator value in the input mapping selects the schema
+    to use, and only that schema is executed -- the remaining branches are
+    never validated against the data. On dump, the branch is selected by an
+    explicit mapping of Python types to discriminator values.
+
+    Example: ::
+
+        class EmailSchema(Schema):
+            address = fields.Email(required=True)
+
+
+        class WebhookSchema(Schema):
+            url = fields.Url(required=True)
+
+
+        class MessageSchema(Schema):
+            payload = fields.DiscriminatedUnion(
+                {"email": EmailSchema, "webhook": WebhookSchema},
+                discriminator="kind",
+                dump_types={Email: "email", Webhook: "webhook"},
+            )
+
+    :param schemas: A dictionary mapping discriminator values to
+        `Schema <marshmallow.Schema>` instances, classes, class names
+        (strings), or callables returning a `Schema <marshmallow.Schema>`
+        or `Schema <marshmallow.Schema>` class.
+    :param discriminator: Name of the input key used as discriminator.
+    :param dump_types: A dictionary mapping Python types to discriminator
+        values, used to select the branch during serialization. An object
+        matching zero or more than one discriminator value is rejected
+        instead of falling back to registration order.
+    :param unknown: Whether to exclude, include, or raise an error for
+        unknown fields in the data. Use `EXCLUDE`, `INCLUDE` or `RAISE`.
+        The value is forwarded to the branch selected during
+        deserialization.
+    :param kwargs: The same keyword arguments that :class:`Field` receives.
+
+    .. note::
+        The input dictionary is never mutated. If the selected branch does
+        not declare the discriminator field itself, the discriminator entry
+        is removed from a *copy* of the input before loading, and the
+        discriminator value is injected into the serialized output.
+
+    .. versionadded:: 4.4.0
+    """
+
+    #: Default error messages.
+    default_error_messages = {
+        "invalid_type": "Invalid input type. Expected a mapping.",
+        "missing_discriminator": "Missing discriminator field {discriminator!r}.",
+        "unknown_discriminator": (
+            "No schema registered for discriminator value {value!r}."
+        ),
+        "unknown_dump_type": (
+            "No `dump_types` entry matches object of type {obj_type!r}."
+        ),
+        "ambiguous_dump_type": (
+            "Multiple `dump_types` entries match object of type {obj_type!r}."
+        ),
+    }
+
+    def __init__(
+        self,
+        schemas: dict[
+            typing.Hashable,
+            Schema
+            | SchemaMeta
+            | str
+            | typing.Callable[[], Schema | SchemaMeta | str],
+        ],
+        *,
+        discriminator: str = "kind",
+        dump_types: dict[type, typing.Hashable] | None = None,
+        unknown: types.UnknownOption | None = None,
+        **kwargs: Unpack[_BaseFieldKwargs],
+    ):
+        self.schemas = dict(schemas)
+        self.discriminator = discriminator
+        self.dump_types = dict(dump_types) if dump_types else {}
+        self.unknown = unknown
+        self._schema_cache: dict[typing.Hashable, Schema] = {}
+        super().__init__(**kwargs)
+
+    def _resolve_schema(self, tag: typing.Hashable) -> Schema:
+        """Return the cached `Schema` instance registered for ``tag``."""
+        try:
+            if tag in self._schema_cache:
+                return self._schema_cache[tag]
+            candidate = self.schemas[tag]
+        except (KeyError, TypeError):
+            raise self.make_error("unknown_discriminator", value=tag) from None
+        # defer the import of `marshmallow.schema` to avoid circular imports
+        from marshmallow.schema import Schema, SchemaMeta  # noqa: PLC0415
+
+        if callable(candidate) and not isinstance(candidate, SchemaMeta):
+            candidate = candidate()
+        if isinstance(candidate, Schema):
+            schema = candidate
+        elif isinstance(candidate, type) and issubclass(candidate, Schema):
+            schema = candidate()
+        elif isinstance(candidate, (str, bytes)):
+            schema = class_registry.get_class(candidate, all=False)()
+        else:
+            raise ValueError(
+                "`DiscriminatedUnion` schemas must be passed a "
+                f"`Schema`, not {candidate.__class__}."
+            )
+        self._schema_cache[tag] = schema
+        return schema
+
+    def _declares_discriminator(self, schema: Schema) -> bool:
+        """Whether ``schema`` declares the discriminator field itself."""
+        return any(
+            name == self.discriminator or field.data_key == self.discriminator
+            for name, field in schema.fields.items()
+        )
+
+    def _select_dump_schema(self, value: typing.Any) -> tuple[Schema, typing.Hashable]:
+        matches = {
+            tag: self._resolve_schema(tag)
+            for typ, tag in self.dump_types.items()
+            if isinstance(value, typ)
+        }
+        obj_type = value.__class__.__name__
+        if not matches:
+            raise self.make_error("unknown_dump_type", obj_type=obj_type)
+        if len(matches) > 1:
+            raise self.make_error("ambiguous_dump_type", obj_type=obj_type)
+        tag, schema = next(iter(matches.items()))
+        return schema, tag
+
+    def _serialize(self, value, attr, obj, **kwargs):
+        if value is None:
+            return None
+        schema, tag = self._select_dump_schema(value)
+        result = schema.dump(value)
+        if not self._declares_discriminator(schema):
+            result[self.discriminator] = tag
+        return result
+
+    def _deserialize(
+        self,
+        value: typing.Any,
+        attr: str | None,
+        data: typing.Mapping[str, typing.Any] | None,
+        partial: bool | types.StrSequenceOrSet | None = None,  # noqa: FBT001
+        **kwargs,
+    ):
+        if not isinstance(value, _Mapping):
+            raise self.make_error("invalid_type")
+        if self.discriminator not in value:
+            raise self.make_error(
+                "missing_discriminator", discriminator=self.discriminator
+            )
+        schema = self._resolve_schema(value[self.discriminator])
+        if self._declares_discriminator(schema):
+            branch_data = value
+        else:
+            # Never mutate the caller's input: strip the discriminator
+            # from a copy so it is not reported as an unknown field.
+            branch_data = dict(value)
+            branch_data.pop(self.discriminator, None)
+        try:
+            return schema.load(branch_data, unknown=self.unknown, partial=partial)
+        except ValidationError as error:
+            raise ValidationError(
+                error.messages, valid_data=error.valid_data
+            ) from error
 
 
 class List(Field[list[_InternalT | None]]):

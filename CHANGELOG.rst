@@ -6,6 +6,8 @@ Changelog
 
 Features:
 
+- Add `DiscriminatedUnion <marshmallow.fields.DiscriminatedUnion>` field for
+  (de)serializing unions of schemas selected by a discriminator field.
 - Simplify `get_value` to match actual usage (:pr:`3024`).
 
 Bug fixes:
