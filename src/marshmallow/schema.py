@@ -20,6 +20,14 @@ from itertools import zip_longest
 
 from marshmallow import class_registry, types
 from marshmallow import fields as ma_fields
+from marshmallow.async_load import (
+    _AsyncLoadContext,
+    _CURRENT_LOAD_CONTEXT,
+    _DeferredNested,
+    contains_deferred,
+    reject_awaitable,
+    unwrap_deferred,
+)
 from marshmallow.constants import EXCLUDE, INCLUDE, RAISE, missing
 from marshmallow.decorators import (
     POST_DUMP,
@@ -603,6 +611,7 @@ class Schema(metaclass=SchemaMeta):
         partial=None,
         unknown: types.UnknownOption = RAISE,
         index=None,
+        _scope=None,
     ) -> typing.Any | list[typing.Any]:
         """Deserialize ``data``.
 
@@ -617,6 +626,8 @@ class Schema(metaclass=SchemaMeta):
             fields in the data. Use `EXCLUDE`, `INCLUDE` or `RAISE`.
         :param index: Index of the item being deserialized (for storing errors) if
             deserializing a collection, otherwise `None`.
+        :param _scope: Async load scope for recording deferred nested loads.
+            Private API.
         :return: The deserialized data as `dict_class` instance or list of `dict_class`
         instances if `many` is `True`.
         """
@@ -634,6 +645,7 @@ class Schema(metaclass=SchemaMeta):
                         partial=partial,
                         unknown=unknown,
                         index=idx,
+                        _scope=_scope,
                     )
                     for idx, d in enumerate(data)
                 ]
@@ -685,6 +697,12 @@ class Schema(metaclass=SchemaMeta):
                     index=index,
                 )
                 if value is not missing:
+                    if _scope is not None and contains_deferred(value):
+                        _scope.deferreds.append((field_name, index, value))
+                        if isinstance(value, _DeferredNested) and value.result is None:
+                            # The nested load failed entirely; like a
+                            # synchronous load, the field is omitted.
+                            continue
                     key = field_obj.attribute or attr_name
                     set_value(ret_d, key, value)
             if unknown != EXCLUDE:
@@ -770,6 +788,57 @@ class Schema(metaclass=SchemaMeta):
         data = self.opts.render_module.loads(s, **kwargs)
         return self.load(data, many=many, partial=partial, unknown=unknown)
 
+    async def load_async(
+        self,
+        data: Mapping[str, typing.Any] | Sequence[Mapping[str, typing.Any]],
+        *,
+        many: bool | None = None,
+        partial: bool | types.StrSequenceOrSet | None = None,
+        unknown: types.UnknownOption | None = None,
+        max_concurrency: int | None = None,
+    ):
+        """Deserialize a data structure to an object defined by this Schema's
+        fields, like `load <marshmallow.Schema.load>`, but additionally run
+        validators that return awaitables.
+
+        Field-level (`validates <marshmallow.decorators.validates>`) and
+        schema-level (`validates_schema <marshmallow.decorators.validates_schema>`)
+        validators may be declared with ``async def`` or otherwise return
+        awaitables. Synchronous validators are supported as well.
+
+        Synchronous deserialization runs to completion first, then the
+        asynchronous validators are awaited, then `post_load
+        <marshmallow.decorators.post_load>` processors run. Nested schemas
+        (including collections loaded with ``many=True``) share the same
+        concurrency limit. Errors are collected in input and declaration
+        order, regardless of the order in which validators complete.
+
+        :param data: The data to deserialize.
+        :param many: Whether to deserialize `data` as a collection. If `None`, the
+            value for `self.many` is used.
+        :param partial: Whether to ignore missing fields and not require
+            any fields declared. Propagates down to ``Nested`` fields as well. If
+            its value is an iterable, only missing fields listed in that iterable
+            will be ignored. Use dot delimiters to specify nested fields.
+        :param unknown: Whether to exclude, include, or raise an error for unknown
+            fields in the data. Use `EXCLUDE`, `INCLUDE` or `RAISE`.
+            If `None`, the value for `self.unknown` is used.
+        :param max_concurrency: Maximum number of asynchronous validators to run
+            concurrently for this load. If `None`, no limit is applied.
+        :return: Deserialized data
+
+        .. versionadded:: 4.4.0
+        """
+        context = _AsyncLoadContext(max_concurrency)
+        return await self._do_load_async(
+            data,
+            many=many,
+            partial=partial,
+            unknown=unknown,
+            postprocess=True,
+            context=context,
+        )
+
     def _run_validator(
         self,
         validator_func: types.SchemaValidator,
@@ -782,35 +851,53 @@ class Schema(metaclass=SchemaMeta):
         unknown: types.UnknownOption | None,
         pass_original: bool,
         index: int | None = None,
+        _scope=None,
     ):
         try:
             if pass_original:  # Pass original, raw data (before unmarshalling)
-                validator_func(
+                result = validator_func(
                     output, original_data, partial=partial, many=many, unknown=unknown
                 )
             else:
-                validator_func(output, partial=partial, many=many, unknown=unknown)
+                result = validator_func(
+                    output, partial=partial, many=many, unknown=unknown
+                )
         except ValidationError as err:
-            field_name = err.field_name
-            data_key: str
-            if field_name == SCHEMA:
-                data_key = SCHEMA
+            self._store_validator_error(err, error_store, index=index)
+        else:
+            if inspect.isawaitable(result):
+                if _scope is None:
+                    reject_awaitable(result)
+                slot_store = ErrorStore()
+                _scope.schedule(
+                    result,
+                    slot_store,
+                    on_error=lambda err: self._store_validator_error(
+                        err, slot_store, index=index
+                    ),
+                )
+
+    def _store_validator_error(
+        self, err: ValidationError, error_store: ErrorStore, *, index: int | None = None
+    ):
+        field_name = err.field_name
+        data_key: str
+        if field_name == SCHEMA:
+            data_key = SCHEMA
+        else:
+            field_obj: Field | None = None
+            try:
+                field_obj = self.fields[field_name]
+            except KeyError:
+                if field_name in self.declared_fields:
+                    field_obj = self.declared_fields[field_name]
+            if field_obj:
+                data_key = (
+                    field_obj.data_key if field_obj.data_key is not None else field_name
+                )
             else:
-                field_obj: Field | None = None
-                try:
-                    field_obj = self.fields[field_name]
-                except KeyError:
-                    if field_name in self.declared_fields:
-                        field_obj = self.declared_fields[field_name]
-                if field_obj:
-                    data_key = (
-                        field_obj.data_key
-                        if field_obj.data_key is not None
-                        else field_name
-                    )
-                else:
-                    data_key = field_name
-            error_store.store_error(err.messages, data_key, index=index)
+                data_key = field_name
+        error_store.store_error(err.messages, data_key, index=index)
 
     def validate(
         self,
@@ -865,11 +952,61 @@ class Schema(metaclass=SchemaMeta):
         :return: Deserialized data
         """
         error_store = ErrorStore()
-        errors: dict[str, list[str]] = {}
         many = self.many if many is None else bool(many)
         unknown = self.unknown if unknown is None else unknown
         if partial is None:
             partial = self.partial
+        result = self._load_stage1(
+            data,
+            many=many,
+            partial=partial,
+            unknown=unknown,
+            error_store=error_store,
+            scope=None,
+        )
+        errors = error_store.errors
+        # Run post processors
+        if not errors and postprocess and self._hooks[POST_LOAD]:
+            try:
+                result = self._invoke_load_processors(
+                    POST_LOAD,
+                    result,
+                    many=many,
+                    original_data=data,
+                    partial=partial,
+                    unknown=unknown,
+                )
+            except ValidationError as err:
+                errors = err.normalized_messages()
+        if errors:
+            exc = ValidationError(errors, data=data, valid_data=result)
+            self.handle_error(exc, data, many=many, partial=partial)
+            raise exc
+
+        return result
+
+    def _load_stage1(
+        self,
+        data: (Mapping[str, typing.Any] | Sequence[Mapping[str, typing.Any]]),
+        *,
+        many: bool,
+        partial: bool | types.StrSequenceOrSet | None,
+        unknown: types.UnknownOption,
+        error_store: ErrorStore,
+        scope,
+    ):
+        """Synchronous stage of loading: pre_load processors, deserialization,
+        and validation.
+
+        If ``scope`` is not `None`, validators returning awaitables are
+        scheduled on the scope instead of being run, and nested schema loads
+        are deferred to the asynchronous phase. Otherwise, a validator
+        returning an awaitable is a usage error.
+
+        This method is private API.
+
+        :return: The deserialized data, before post_load processing.
+        """
         # Run preprocessors
         if self._hooks[PRE_LOAD]:
             try:
@@ -882,50 +1019,104 @@ class Schema(metaclass=SchemaMeta):
                     unknown=unknown,
                 )
             except ValidationError as err:
-                errors = err.normalized_messages()
-                result: list | dict | None = None
+                error_store.errors = err.normalized_messages()
+                return None
         else:
             processed_data = data
-        if not errors:
-            # Deserialize data
+        # Deserialize data
+        token = _CURRENT_LOAD_CONTEXT.set(
+            scope.context if scope is not None else None
+        )
+        try:
             result = self._deserialize(
                 processed_data,
                 error_store=error_store,
                 many=many,
                 partial=partial,
                 unknown=unknown,
+                _scope=scope,
             )
-            # Run field-level validation
-            self._invoke_field_validators(
-                error_store=error_store, data=result, many=many
+        finally:
+            _CURRENT_LOAD_CONTEXT.reset(token)
+        # Run field-level validation
+        self._invoke_field_validators(
+            error_store=error_store, data=result, many=many, _scope=scope
+        )
+        # Run schema-level validation
+        if self._hooks[VALIDATES_SCHEMA]:
+            field_errors = bool(error_store.errors)
+            self._invoke_schema_validators(
+                error_store=error_store,
+                pass_collection=True,
+                data=result,
+                original_data=data,
+                many=many,
+                partial=partial,
+                unknown=unknown,
+                field_errors=field_errors,
+                _scope=scope,
             )
-            # Run schema-level validation
-            if self._hooks[VALIDATES_SCHEMA]:
-                field_errors = bool(error_store.errors)
-                self._invoke_schema_validators(
-                    error_store=error_store,
-                    pass_collection=True,
-                    data=result,
-                    original_data=data,
-                    many=many,
-                    partial=partial,
-                    unknown=unknown,
-                    field_errors=field_errors,
-                )
-                self._invoke_schema_validators(
-                    error_store=error_store,
-                    pass_collection=False,
-                    data=result,
-                    original_data=data,
-                    many=many,
-                    partial=partial,
-                    unknown=unknown,
-                    field_errors=field_errors,
-                )
-            errors = error_store.errors
-            # Run post processors
-            if not errors and postprocess and self._hooks[POST_LOAD]:
-                try:
+            self._invoke_schema_validators(
+                error_store=error_store,
+                pass_collection=False,
+                data=result,
+                original_data=data,
+                many=many,
+                partial=partial,
+                unknown=unknown,
+                field_errors=field_errors,
+                _scope=scope,
+            )
+        return result
+
+    async def _do_load_async(
+        self,
+        data: (Mapping[str, typing.Any] | Sequence[Mapping[str, typing.Any]]),
+        *,
+        many: bool | None = None,
+        partial: bool | types.StrSequenceOrSet | None = None,
+        unknown: types.UnknownOption | None = None,
+        postprocess: bool = True,
+        context: _AsyncLoadContext,
+    ):
+        """Asynchronously deserialize `data`, returning the deserialized result.
+        This method is private API.
+
+        Runs the synchronous stage of loading, then awaits the deferred
+        asynchronous validators (including those of nested schemas), and
+        finally runs post_load processors.
+        """
+        error_store = ErrorStore()
+        scope = context.new_scope()
+        scope.error_store = error_store
+        many = self.many if many is None else bool(many)
+        unknown = self.unknown if unknown is None else unknown
+        if partial is None:
+            partial = self.partial
+        try:
+            result = self._load_stage1(
+                data,
+                many=many,
+                partial=partial,
+                unknown=unknown,
+                error_store=error_store,
+                scope=scope,
+            )
+        except BaseException:
+            # Synchronous stage failed after validators were scheduled;
+            # cancel the spawned tasks before propagating
+            await context.shutdown()
+            raise
+        # Run the deferred asynchronous validators and merge their errors
+        await context.run()
+        errors = error_store.errors
+        if not errors:
+            try:
+                # Resolve deferred nested loads, running their post_load
+                # processors (innermost first)
+                result = unwrap_deferred(result, finalize=True)
+                # Run post processors
+                if postprocess and self._hooks[POST_LOAD]:
                     result = self._invoke_load_processors(
                         POST_LOAD,
                         result,
@@ -934,13 +1125,68 @@ class Schema(metaclass=SchemaMeta):
                         partial=partial,
                         unknown=unknown,
                     )
-                except ValidationError as err:
-                    errors = err.normalized_messages()
+            except ValidationError as err:
+                errors = err.normalized_messages()
         if errors:
-            exc = ValidationError(errors, data=data, valid_data=result)
+            exc = ValidationError(
+                errors, data=data, valid_data=unwrap_deferred(result, finalize=False)
+            )
             self.handle_error(exc, data, many=many, partial=partial)
             raise exc
 
+        return result
+
+    def _defer_load(
+        self,
+        data: (Mapping[str, typing.Any] | Sequence[Mapping[str, typing.Any]]),
+        *,
+        unknown: types.UnknownOption | None,
+        partial: bool | types.StrSequenceOrSet | None,
+        context: _AsyncLoadContext,
+    ) -> _DeferredNested:
+        """Run the synchronous stage of loading and defer the asynchronous
+        validators and post_load processors to the enclosing
+        `Schema.load_async` call. Called by `fields.Nested <marshmallow.fields.Nested>`
+        during an asynchronous load. This method is private API.
+        """
+        error_store = ErrorStore()
+        scope = context.new_scope()
+        scope.error_store = error_store
+        many = self.many
+        unknown = self.unknown if unknown is None else unknown
+        if partial is None:
+            partial = self.partial
+        result = self._load_stage1(
+            data,
+            many=many,
+            partial=partial,
+            unknown=unknown,
+            error_store=error_store,
+            scope=scope,
+        )
+        return _DeferredNested(
+            schema=self,
+            result=result,
+            error_store=error_store,
+            many=many,
+            partial=partial,
+            unknown=unknown,
+            data=data,
+        )
+
+    def _finalize_deferred(self, deferred: _DeferredNested, result):
+        """Run the deferred post_load processors of a nested load.
+        This method is private API.
+        """
+        if self._hooks[POST_LOAD]:
+            result = self._invoke_load_processors(
+                POST_LOAD,
+                result,
+                many=deferred.many,
+                original_data=deferred.data,
+                partial=deferred.partial,
+                unknown=deferred.unknown,
+            )
         return result
 
     def _normalize_nested_options(self) -> None:
@@ -1121,7 +1367,9 @@ class Schema(metaclass=SchemaMeta):
             unknown=unknown,
         )
 
-    def _invoke_field_validators(self, *, error_store: ErrorStore, data, many: bool):
+    def _invoke_field_validators(
+        self, *, error_store: ErrorStore, data, many: bool, _scope=None
+    ):
         for attr_name, _, validator_kwargs in self._hooks[VALIDATES]:
             validator = getattr(self, attr_name)
 
@@ -1147,29 +1395,77 @@ class Schema(metaclass=SchemaMeta):
                         except KeyError:
                             pass
                         else:
-                            validated_value = self._call_and_store(
-                                getter_func=do_validate,
-                                data=value,
-                                field_name=data_key,
+                            self._run_field_validator(
+                                do_validate,
+                                value,
+                                item=item,
+                                field_name=field_name,
+                                data_key=data_key,
                                 error_store=error_store,
                                 index=(idx if self.opts.index_errors else None),
+                                scope=_scope,
                             )
-                            if validated_value is missing:
-                                item.pop(field_name, None)
                 else:
                     try:
                         value = data[field_obj.attribute or field_name]
                     except KeyError:
                         pass
                     else:
-                        validated_value = self._call_and_store(
-                            getter_func=do_validate,
-                            data=value,
-                            field_name=data_key,
+                        self._run_field_validator(
+                            do_validate,
+                            value,
+                            item=data,
+                            field_name=field_name,
+                            data_key=data_key,
                             error_store=error_store,
+                            index=None,
+                            scope=_scope,
                         )
-                        if validated_value is missing:
-                            data.pop(field_name, None)
+
+    @staticmethod
+    def _run_field_validator(
+        do_validate,
+        value,
+        *,
+        item,
+        field_name: str,
+        data_key: str,
+        error_store: ErrorStore,
+        index: int | None,
+        scope,
+    ):
+        """Run a single field-level validator, storing any error.
+
+        If the validator returns an awaitable, it is scheduled on ``scope``
+        for the asynchronous phase of `Schema.load_async`. If ``scope`` is
+        `None`, an awaitable is a usage error.
+        """
+        try:
+            result = do_validate(value)
+        except ValidationError as error:
+            error_store.store_error(error.messages, data_key, index=index)
+            if not error.valid_data:
+                item.pop(field_name, None)
+            return
+        if inspect.isawaitable(result):
+            if scope is None:
+                reject_awaitable(result)
+            slot_store = ErrorStore()
+
+            def on_error(error: ValidationError) -> None:
+                slot_store.store_error(error.messages, data_key, index=index)
+                if not error.valid_data:
+                    item.pop(field_name, None)
+
+            def on_result(validated_value) -> None:
+                if validated_value is missing:
+                    item.pop(field_name, None)
+
+            scope.schedule(
+                result, slot_store, on_error=on_error, on_result=on_result
+            )
+        elif result is missing:
+            item.pop(field_name, None)
 
     def _invoke_schema_validators(
         self,
@@ -1182,6 +1478,7 @@ class Schema(metaclass=SchemaMeta):
         partial: bool | types.StrSequenceOrSet | None,
         field_errors: bool = False,
         unknown: types.UnknownOption | None,
+        _scope=None,
     ):
         for attr_name, hook_many, validator_kwargs in self._hooks[VALIDATES_SCHEMA]:
             if hook_many != pass_collection:
@@ -1205,6 +1502,7 @@ class Schema(metaclass=SchemaMeta):
                         unknown=unknown,
                         index=idx,
                         pass_original=pass_original,
+                        _scope=_scope,
                     )
             else:
                 self._run_validator(
@@ -1216,6 +1514,7 @@ class Schema(metaclass=SchemaMeta):
                     pass_original=pass_original,
                     partial=partial,
                     unknown=unknown,
+                    _scope=_scope,
                 )
 
     def _invoke_processors(

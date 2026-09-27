@@ -639,6 +639,15 @@ class Nested(Field):
         value: typing.Any,
         partial: bool | types.StrSequenceOrSet | None = None,  # noqa: FBT001
     ):
+        from marshmallow.async_load import current_load_context  # noqa: PLC0415
+
+        context = current_load_context()
+        if context is not None:
+            # An asynchronous load is in progress: defer asynchronous
+            # validators and post_load processors to its async phase.
+            return self.schema._defer_load(
+                value, unknown=self.unknown, partial=partial, context=context
+            )
         try:
             valid_data = self.schema.load(value, unknown=self.unknown, partial=partial)
         except ValidationError as error:

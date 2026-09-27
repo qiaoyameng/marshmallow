@@ -6,6 +6,11 @@ Changelog
 
 Features:
 
+- Add `Schema.load_async <marshmallow.Schema.load_async>`, which allows
+  field-level and schema-level validators to return awaitables. Asynchronous
+  validators run after synchronous deserialization and before ``post_load``
+  processors, with an optional shared concurrency limit across nested schemas
+  and collections.
 - Simplify `get_value` to match actual usage (:pr:`3024`).
 
 Bug fixes:
