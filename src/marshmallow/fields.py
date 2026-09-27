@@ -664,7 +664,11 @@ class Nested(Field):
             Add ``partial`` parameter.
         """
         self._test_collection(value)
-        return self._load(value, partial=partial)
+        # deferred import of `marshmallow.schema` to avoid circular imports
+        from marshmallow.schema import _async_key_prefix  # noqa: PLC0415
+
+        with _async_key_prefix(attr):
+            return self._load(value, partial=partial)
 
 
 class Pluck(Nested):
@@ -726,7 +730,11 @@ class Pluck(Nested):
             value = [{self._field_data_key: v} for v in value]
         else:
             value = {self._field_data_key: value}
-        return self._load(value, partial=partial)
+        # deferred import of `marshmallow.schema` to avoid circular imports
+        from marshmallow.schema import _async_key_prefix  # noqa: PLC0415
+
+        with _async_key_prefix(attr):
+            return self._load(value, partial=partial)
 
 
 class List(Field[list[_InternalT | None]]):
@@ -781,15 +789,20 @@ class List(Field[list[_InternalT | None]]):
         if not utils.is_collection(value):
             raise self.make_error("invalid")
 
+        # deferred import of `marshmallow.schema` to avoid circular imports
+        from marshmallow.schema import _async_key_prefix  # noqa: PLC0415
+
         result = []
         errors = {}
-        for idx, each in enumerate(value):
-            try:
-                result.append(self.inner.deserialize(each, **kwargs))
-            except ValidationError as error:
-                if error.valid_data is not None:
-                    result.append(typing.cast("_InternalT", error.valid_data))
-                errors.update({idx: error.messages})
+        with _async_key_prefix(attr):
+            for idx, each in enumerate(value):
+                try:
+                    with _async_key_prefix(idx):
+                        result.append(self.inner.deserialize(each, **kwargs))
+                except ValidationError as error:
+                    if error.valid_data is not None:
+                        result.append(typing.cast("_InternalT", error.valid_data))
+                    errors.update({idx: error.messages})
         if errors:
             raise ValidationError(errors, valid_data=result)
         return result
@@ -875,16 +888,23 @@ class Tuple(Field[tuple]):
 
         self.validate_length(value)
 
+        # deferred import of `marshmallow.schema` to avoid circular imports
+        from marshmallow.schema import _async_key_prefix  # noqa: PLC0415
+
         result = []
         errors = {}
 
-        for idx, (field, each) in enumerate(zip(self.tuple_fields, value, strict=True)):
-            try:
-                result.append(field.deserialize(each, **kwargs))
-            except ValidationError as error:
-                if error.valid_data is not None:
-                    result.append(error.valid_data)
-                errors.update({idx: error.messages})
+        with _async_key_prefix(attr):
+            for idx, (field, each) in enumerate(
+                zip(self.tuple_fields, value, strict=True)
+            ):
+                try:
+                    with _async_key_prefix(idx):
+                        result.append(field.deserialize(each, **kwargs))
+                except ValidationError as error:
+                    if error.valid_data is not None:
+                        result.append(error.valid_data)
+                    errors.update({idx: error.messages})
         if errors:
             raise ValidationError(errors, valid_data=result)
 
@@ -1691,6 +1711,9 @@ class Mapping(Field[_MappingT], metaclass=abc.ABCMeta):
         if not self.value_field and not self.key_field:
             return self.mapping_type(value)
 
+        # deferred import of `marshmallow.schema` to avoid circular imports
+        from marshmallow.schema import _async_key_prefix  # noqa: PLC0415
+
         errors = collections.defaultdict(dict)
 
         # Deserialize keys
@@ -1700,7 +1723,8 @@ class Mapping(Field[_MappingT], metaclass=abc.ABCMeta):
             keys = {}
             for key in value:
                 try:
-                    keys[key] = self.key_field.deserialize(key, **kwargs)
+                    with _async_key_prefix(attr), _async_key_prefix(key):
+                        keys[key] = self.key_field.deserialize(key, **kwargs)
                 except ValidationError as error:
                     errors[key]["key"] = error.messages
 
@@ -1713,7 +1737,8 @@ class Mapping(Field[_MappingT], metaclass=abc.ABCMeta):
         else:
             for key, val in value.items():
                 try:
-                    deser_val = self.value_field.deserialize(val, **kwargs)
+                    with _async_key_prefix(attr), _async_key_prefix(key):
+                        deser_val = self.value_field.deserialize(val, **kwargs)
                 except ValidationError as error:
                     errors[key]["value"] = error.messages
                     if error.valid_data is not None and key in keys:

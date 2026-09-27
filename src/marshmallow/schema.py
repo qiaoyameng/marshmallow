@@ -3,6 +3,9 @@
 # ruff: noqa: SLF001
 from __future__ import annotations
 
+import asyncio
+import contextlib
+import contextvars
 import copy
 import datetime as dt
 import decimal
@@ -15,7 +18,7 @@ import typing
 import uuid
 from abc import ABCMeta
 from collections import defaultdict
-from collections.abc import Mapping, Sequence
+from collections.abc import Hashable, Mapping, Sequence
 from itertools import zip_longest
 
 from marshmallow import class_registry, types
@@ -30,6 +33,7 @@ from marshmallow.decorators import (
     VALIDATES_SCHEMA,
 )
 from marshmallow.error_store import ErrorStore
+from marshmallow.error_store import merge_errors
 from marshmallow.exceptions import SCHEMA, StringNotCollectionError, ValidationError
 from marshmallow.orderedset import OrderedSet
 from marshmallow.utils import (
@@ -84,6 +88,106 @@ def _get_fields_by_mro(klass: SchemaMeta):
         ),
         [],
     )
+
+
+class _AsyncLoadContext:
+    """State shared by all schemas involved in a single `Schema.load_async` call.
+
+    Validators that return an awaitable are registered here during the
+    synchronous deserialization phase instead of being run, so that they can
+    be awaited together -- bounded by a shared concurrency limit -- before
+    ``post_load`` processors run. Nested schemas and ``many=True`` loads
+    register into the same context, so they share the same limit.
+    """
+
+    def __init__(self) -> None:
+        #: Deferred ``(awaitable, error_store, key_prefix)`` entries,
+        #: in registration (input and declaration) order
+        self.pending: list[tuple[typing.Awaitable[None], ErrorStore, tuple]] = []
+        #: Stack of keys (data keys or indices) wrapping errors of nested fields
+        self.key_stack: list[Hashable] = []
+        #: Errors collected during the synchronous phase of the root schema
+        self.sync_errors: dict | None = None
+        self._root_claimed = False
+
+    def claim_root(self) -> bool:
+        """Return `True` for the first (root) schema of the async load."""
+        if self._root_claimed:
+            return False
+        self._root_claimed = True
+        return True
+
+    def register(
+        self, awaitable: typing.Awaitable[None], error_store: ErrorStore
+    ) -> None:
+        self.pending.append((awaitable, error_store, tuple(self.key_stack)))
+
+
+_ASYNC_LOAD_CONTEXT: contextvars.ContextVar[_AsyncLoadContext | None] = (
+    contextvars.ContextVar("marshmallow_async_load_context", default=None)
+)
+
+
+@contextlib.contextmanager
+def _async_key_prefix(key: Hashable) -> typing.Iterator[None]:
+    """Push ``key`` onto the key stack of the active async load, if any.
+
+    Used by container fields (e.g. `Nested <marshmallow.fields.Nested>`) so
+    that errors from deferred validators are nested under the correct key.
+    """
+    ctx = _ASYNC_LOAD_CONTEXT.get()
+    if ctx is None or key is None:
+        yield
+        return
+    ctx.key_stack.append(key)
+    try:
+        yield
+    finally:
+        ctx.key_stack.pop()
+
+
+async def _run_pending_validators(
+    ctx: _AsyncLoadContext, max_concurrent_validations: int | None
+) -> dict:
+    """Await all deferred validators and merge their errors.
+
+    Errors are merged in registration order, so the resulting dictionary does
+    not depend on the order in which validators complete.
+    """
+    if not ctx.pending:
+        return {}
+    semaphore = (
+        asyncio.Semaphore(max_concurrent_validations)
+        if max_concurrent_validations is not None
+        else None
+    )
+
+    async def run(awaitable: typing.Awaitable[None]) -> None:
+        if semaphore is None:
+            await awaitable
+        else:
+            async with semaphore:
+                await awaitable
+
+    tasks = [asyncio.ensure_future(run(awaitable)) for awaitable, _, _ in ctx.pending]
+    try:
+        await asyncio.gather(*tasks)
+    except BaseException:  # noqa: BLE001
+        # Wait for the tasks spawned by this load to exit before propagating,
+        # e.g. when the caller cancels the load.
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        raise
+    errors: dict = {}
+    for _, error_store, key_prefix in ctx.pending:
+        if not error_store.errors:
+            continue
+        messages = error_store.errors
+        for key in reversed(key_prefix):
+            messages = {key: messages}
+        errors = merge_errors(errors, messages)
+    return errors
 
 
 class SchemaMeta(ABCMeta):
@@ -527,6 +631,29 @@ class Schema(metaclass=SchemaMeta):
             return error.valid_data or missing
         return value
 
+    def _call_validator_and_store(
+        self, getter_func, data, *, field_name, error_store, index=None
+    ):
+        """Call a field validator and store any `ValidationError`.
+
+        If the validator returns an awaitable, it is deferred to the active
+        `load_async <marshmallow.Schema.load_async>` context, if any.
+        """
+        try:
+            value = getter_func(data)
+        except ValidationError as error:
+            error_store.store_error(error.messages, field_name, index=index)
+            return error.valid_data or missing
+        if inspect.isawaitable(value):
+            self._defer_awaitable(
+                value,
+                lambda error, store: store.store_error(
+                    error.messages, field_name, index=index
+                ),
+            )
+            return None
+        return value
+
     def _serialize(self, obj: typing.Any, *, many: bool = False):
         """Serialize ``obj``.
 
@@ -626,17 +753,21 @@ class Schema(metaclass=SchemaMeta):
                 error_store.store_error([self.error_messages["type"]], index=index)
                 ret_l = []
             else:
-                ret_l = [
-                    self._deserialize(
-                        d,
-                        error_store=error_store,
-                        many=False,
-                        partial=partial,
-                        unknown=unknown,
-                        index=idx,
-                    )
-                    for idx, d in enumerate(data)
-                ]
+                ret_l = []
+                for idx, d in enumerate(data):
+                    # Push the item index so that errors from deferred async
+                    # validators of nested fields are indexed correctly.
+                    with _async_key_prefix(idx if self.opts.index_errors else None):
+                        ret_l.append(
+                            self._deserialize(
+                                d,
+                                error_store=error_store,
+                                many=False,
+                                partial=partial,
+                                unknown=unknown,
+                                index=idx,
+                            )
+                        )
             return ret_l
         ret_d = self.dict_class()
         # Check data is a dict
@@ -735,6 +866,101 @@ class Schema(metaclass=SchemaMeta):
             data, many=many, partial=partial, unknown=unknown, postprocess=True
         )
 
+    async def load_async(
+        self,
+        data: Mapping[str, typing.Any] | Sequence[Mapping[str, typing.Any]],
+        *,
+        many: bool | None = None,
+        partial: bool | types.StrSequenceOrSet | None = None,
+        unknown: types.UnknownOption | None = None,
+        max_concurrent_validations: int | None = None,
+    ):
+        """Asynchronous counterpart of `load <marshmallow.Schema.load>` that
+        supports asynchronous validators.
+
+        Field validators (registered with `validates <marshmallow.decorators.validates>`)
+        and schema validators (registered with
+        `validates_schema <marshmallow.decorators.validates_schema>`) may be
+        declared with ``async def`` or otherwise return an awaitable. Synchronous
+        validators are supported as well and run inline, as with `load`.
+
+        Loading proceeds in three phases:
+
+        1. Synchronous deserialization (including ``pre_load`` processors and
+           synchronous validators), exactly as `load <marshmallow.Schema.load>`.
+        2. Awaiting the asynchronous validators, which only run for fields that
+           deserialized successfully. Nested schemas and ``many=True`` loads
+           share the same concurrency budget.
+        3. ``post_load`` processors, which run only if no errors were collected.
+
+        Errors are collected in input and declaration order, regardless of the
+        order in which asynchronous validators complete. If the load is
+        cancelled, the validators it spawned are awaited before the
+        cancellation propagates.
+
+        :param data: The data to deserialize.
+        :param many: Whether to deserialize `data` as a collection. If `None`, the
+            value for `self.many` is used.
+        :param partial: Whether to ignore missing fields and not require
+            any fields declared. Propagates down to ``Nested`` fields as well. If
+            its value is an iterable, only missing fields listed in that iterable
+            will be ignored. Use dot delimiters to specify nested fields.
+        :param unknown: Whether to exclude, include, or raise an error for unknown
+            fields in the data. Use `EXCLUDE`, `INCLUDE` or `RAISE`.
+            If `None`, the value for `self.unknown` is used.
+        :param max_concurrent_validations: Maximum number of asynchronous
+            validators allowed to run concurrently. If `None`, no limit is
+            applied.
+        :return: Deserialized data
+
+        .. versionadded:: 4.4.0
+        """
+        if max_concurrent_validations is not None and max_concurrent_validations < 1:
+            raise ValueError(
+                "`max_concurrent_validations` must be a positive integer or None."
+            )
+        many = self.many if many is None else bool(many)
+        unknown = self.unknown if unknown is None else unknown
+        if partial is None:
+            partial = self.partial
+        async_ctx = _AsyncLoadContext()
+        token = _ASYNC_LOAD_CONTEXT.set(async_ctx)
+        try:
+            # Synchronous phase. Deferred validators register into async_ctx.
+            # As the root of the load, this call does not raise on validation
+            # errors; it stores them on the context instead.
+            result = self._do_load(
+                data, many=many, partial=partial, unknown=unknown, postprocess=False
+            )
+        finally:
+            _ASYNC_LOAD_CONTEXT.reset(token)
+        # Await deferred asynchronous validators
+        async_errors = await _run_pending_validators(
+            async_ctx, max_concurrent_validations
+        )
+        errors = merge_errors(async_ctx.sync_errors or {}, async_errors)
+        if errors:
+            exc = ValidationError(errors, data=data, valid_data=result)
+            self.handle_error(exc, data, many=many, partial=partial)
+            raise exc
+        # Run post processors only after all validation has passed
+        if self._hooks[POST_LOAD]:
+            try:
+                result = self._invoke_load_processors(
+                    POST_LOAD,
+                    result,
+                    many=many,
+                    original_data=data,
+                    partial=partial,
+                    unknown=unknown,
+                )
+            except ValidationError as err:
+                errors = err.normalized_messages()
+                exc = ValidationError(errors, data=data, valid_data=result)
+                self.handle_error(exc, data, many=many, partial=partial)
+                raise exc
+        return result
+
     def loads(
         self,
         s: str | bytes | bytearray,
@@ -785,32 +1011,76 @@ class Schema(metaclass=SchemaMeta):
     ):
         try:
             if pass_original:  # Pass original, raw data (before unmarshalling)
-                validator_func(
+                result = validator_func(
                     output, original_data, partial=partial, many=many, unknown=unknown
                 )
             else:
-                validator_func(output, partial=partial, many=many, unknown=unknown)
+                result = validator_func(
+                    output, partial=partial, many=many, unknown=unknown
+                )
         except ValidationError as err:
-            field_name = err.field_name
-            data_key: str
-            if field_name == SCHEMA:
-                data_key = SCHEMA
+            self._store_schema_validator_error(err, error_store=error_store, index=index)
+            return
+        if inspect.isawaitable(result):
+            self._defer_awaitable(
+                result,
+                lambda error, store: self._store_schema_validator_error(
+                    error, error_store=store, index=index
+                ),
+            )
+
+    def _store_schema_validator_error(
+        self, err: ValidationError, *, error_store: ErrorStore, index: int | None = None
+    ):
+        field_name = err.field_name
+        data_key: str
+        if field_name == SCHEMA:
+            data_key = SCHEMA
+        else:
+            field_obj: Field | None = None
+            try:
+                field_obj = self.fields[field_name]
+            except KeyError:
+                if field_name in self.declared_fields:
+                    field_obj = self.declared_fields[field_name]
+            if field_obj:
+                data_key = (
+                    field_obj.data_key if field_obj.data_key is not None else field_name
+                )
             else:
-                field_obj: Field | None = None
-                try:
-                    field_obj = self.fields[field_name]
-                except KeyError:
-                    if field_name in self.declared_fields:
-                        field_obj = self.declared_fields[field_name]
-                if field_obj:
-                    data_key = (
-                        field_obj.data_key
-                        if field_obj.data_key is not None
-                        else field_name
-                    )
-                else:
-                    data_key = field_name
-            error_store.store_error(err.messages, data_key, index=index)
+                data_key = field_name
+        error_store.store_error(err.messages, data_key, index=index)
+
+    @staticmethod
+    def _defer_awaitable(
+        awaitable: typing.Awaitable[None],
+        store_error: typing.Callable[[ValidationError, ErrorStore], None],
+    ) -> None:
+        """Register an awaitable validator result with the active
+        `load_async <marshmallow.Schema.load_async>` context.
+
+        Raise a `RuntimeError` if there is no active async load, i.e. an
+        asynchronous validator was used during synchronous deserialization.
+        """
+        async_ctx = _ASYNC_LOAD_CONTEXT.get()
+        if async_ctx is None:
+            close = getattr(awaitable, "close", None)
+            if close is not None:
+                close()
+            raise RuntimeError(
+                "Validator returned an awaitable during synchronous "
+                "deserialization. Use `Schema.load_async()` to run "
+                "asynchronous validators."
+            )
+        entry_store = ErrorStore()
+
+        async def run() -> None:
+            try:
+                await awaitable
+            except ValidationError as error:
+                store_error(error, entry_store)
+
+        async_ctx.register(run(), entry_store)
 
     def validate(
         self,
@@ -870,6 +1140,11 @@ class Schema(metaclass=SchemaMeta):
         unknown = self.unknown if unknown is None else unknown
         if partial is None:
             partial = self.partial
+        async_ctx = _ASYNC_LOAD_CONTEXT.get()
+        # The first schema to run under an async load context is the root of
+        # the load. It defers error handling to `load_async`, which first
+        # awaits any deferred asynchronous validators.
+        is_async_root = async_ctx is not None and async_ctx.claim_root()
         # Run preprocessors
         if self._hooks[PRE_LOAD]:
             try:
@@ -936,6 +1211,9 @@ class Schema(metaclass=SchemaMeta):
                     )
                 except ValidationError as err:
                     errors = err.normalized_messages()
+        if is_async_root:
+            async_ctx.sync_errors = errors or None
+            return result
         if errors:
             exc = ValidationError(errors, data=data, valid_data=result)
             self.handle_error(exc, data, many=many, partial=partial)
@@ -1147,7 +1425,7 @@ class Schema(metaclass=SchemaMeta):
                         except KeyError:
                             pass
                         else:
-                            validated_value = self._call_and_store(
+                            validated_value = self._call_validator_and_store(
                                 getter_func=do_validate,
                                 data=value,
                                 field_name=data_key,
@@ -1162,7 +1440,7 @@ class Schema(metaclass=SchemaMeta):
                     except KeyError:
                         pass
                     else:
-                        validated_value = self._call_and_store(
+                        validated_value = self._call_validator_and_store(
                             getter_func=do_validate,
                             data=value,
                             field_name=data_key,

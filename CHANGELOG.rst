@@ -6,6 +6,15 @@ Changelog
 
 Features:
 
+- Add `Schema.load_async <marshmallow.Schema.load_async>`, an asynchronous
+  counterpart of `Schema.load <marshmallow.Schema.load>`. Field validators
+  (`validates <marshmallow.decorators.validates>`) and schema validators
+  (`validates_schema <marshmallow.decorators.validates_schema>`) may return
+  awaitables, which are awaited after synchronous deserialization and before
+  ``post_load`` processors run. The ``max_concurrent_validations`` parameter
+  limits concurrently running validators and is shared by nested schemas and
+  ``many=True`` loads. Using an asynchronous validator with the synchronous
+  `load <marshmallow.Schema.load>` raises a `RuntimeError`.
 - Simplify `get_value` to match actual usage (:pr:`3024`).
 
 Bug fixes:
